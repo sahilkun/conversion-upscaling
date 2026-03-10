@@ -194,7 +194,3 @@ ffplay out/master.m3u8
 ```
 
 For seek preview thumbnails, use a player that supports VTT thumbnail tracks (e.g., Video.js with the thumbnails plugin) pointed at `out/thumbs/thumbs.vtt`.
-
-## License
-
-MIT
