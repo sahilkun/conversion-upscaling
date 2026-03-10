@@ -126,8 +126,6 @@ def encode_hls(src, name):
         "-i", src,
         "-vf", f"scale_cuda={w}:{h}:interp_algo=lanczos:format=yuv420p",
         "-aspect", "16:9",
-        "-metadata", "title=hentaiclick.tv",
-        "-metadata:s:v:0", "title=Upscaled by hentaiclick.tv",
     ]
     cmd += _nvenc_flags(br, abr)
     cmd += _hls_flags(outdir)
@@ -309,8 +307,6 @@ def export_upscaled(src):
         "-i", src,
         "-vf", "scale_cuda=3840:2160:interp_algo=lanczos:format=yuv420p",
         "-aspect", "16:9",
-        "-metadata", "title=hentaiclick.tv",
-        "-metadata:s:v:0", "title=Upscaled by hentaiclick.tv",
         "-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq",
         "-profile:v", "high",
         "-rc:v", "vbr", "-cq", "26",
