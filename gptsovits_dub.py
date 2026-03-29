@@ -472,9 +472,9 @@ def mix_final(voice_path, vocals_path, bg_path, manifest, total_duration, output
         "-i", vocals_path,
         "-i", bg_path,
         "-filter_complex",
-        f"[0]volume=2.5[en];"
+        f"[0]volume=1.5[en];"
         f"[1]{vocal_filter}[ja];"
-        f"[2]volume=0.5[bg];"
+        f"[2]volume=0.8[bg];"
         f"[en][ja][bg]amix=inputs=3:duration=longest:normalize=0[out]",
         "-map", "[out]",
         "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
@@ -555,12 +555,20 @@ def main():
     sys.path.insert(0, gptsovits_dir)
     from GPT_SoVITS.TTS_infer_pack.TTS import TTS, TTS_Config
     config = TTS_Config("GPT_SoVITS/configs/tts_infer.yaml")
-    # Use v2 model — confirmed working in initial test
+    # Use fine-tuned models from training
+    trained_s2 = os.path.join(gptsovits_dir, "experiments", "natsu_to_hako", "logs_s2_v2", "G_233333333333.pth")
+    trained_s1 = os.path.join(gptsovits_dir, "experiments", "natsu_to_hako", "logs_s1_v2", "ckpt", "epoch=19-step=500.ckpt")
+    if os.path.exists(trained_s2) and os.path.exists(trained_s1):
+        config.configs["t2s_weights_path"] = trained_s1
+        config.configs["vits_weights_path"] = trained_s2
+        print(f"  Using FINE-TUNED models!")
+    else:
+        print(f"  WARNING: Trained models not found, using pretrained")
     config.configs["device"] = "cuda"
     config.configs["is_half"] = False
     tts = TTS(config)
     os.chdir(original_cwd)
-    print("  Model loaded (v2)!")
+    print("  Model loaded!")
 
     # Step 6: Generate clips
     if args.no_cache:
@@ -590,10 +598,10 @@ def main():
             continue
 
         target = m["target_duration"]
-        if clip_dur > target * 1.15 and target > 0.3:
+        if clip_dur > target * 1.2 and target > 0.3:
             ratio = clip_dur / target
-            # Cap at 1.3x speedup — let longer clips overlap slightly
-            ratio = min(ratio, 1.3)
+            # Cap at 1.15x speedup — preserve natural pacing, allow overlap
+            ratio = min(ratio, 1.15)
             tmp = clip + ".tempo.wav"
             subprocess.run([
                 "ffmpeg", "-y", "-i", clip,
@@ -605,7 +613,7 @@ def main():
                 stretched += 1
             elif os.path.exists(tmp):
                 os.remove(tmp)
-    print(f"  Stretched {stretched} clips (max 1.3x, pitch preserved)")
+    print(f"  Stretched {stretched} clips (max 1.15x, pitch preserved)")
 
     # Step 8: Assemble voice track
     voice_path = assemble_voice_track(manifest, total_duration)

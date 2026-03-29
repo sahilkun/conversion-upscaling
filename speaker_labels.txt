@@ -119,7 +119,7 @@ F 115 [07:09] You touched me, didn't you?
 M 116 [07:17] You...!
 M 117 [07:39] She did it on her own...!
 F 118 [07:52] Hey, you want to see my vagina?
-M, F 119 [08:04] One, two...
+ 119 [08:04] One, two...
 F 120 [08:13] That... you...
 M 121 [08:16] Haven't you ever seen someone else's naked body, apart from your family?
 F 122 [08:20] Of course!
@@ -148,7 +148,7 @@ F 144 [09:47] That's enough!
 M 145 [09:50] J-Just this?
 F 146 [09:52] We agreed only "the tip"!
 M 147 [09:58] I understand, but...
-F,M 148 [10:03] This is awkward!
+  148 [10:03] This is awkward!
 M 149 [10:08] Hey, you're suffering, too, aren't you?
 F 150 [10:12] Yeah, but...
 F 151 [10:16] We can only have sex when we're adults... Shut up!
