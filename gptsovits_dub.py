@@ -475,7 +475,9 @@ def mix_final(voice_path, vocals_path, bg_path, manifest, total_duration, output
         f"[0]volume=1.5[en];"
         f"[1]{vocal_filter}[ja];"
         f"[2]volume=0.8[bg];"
-        f"[en][ja][bg]amix=inputs=3:duration=longest:normalize=0[out]",
+        f"[en][ja][bg]amix=inputs=3:duration=longest:normalize=0,"
+        f"compand=attacks=0.05:decays=0.3:points=-80/-80|-30/-15|-10/-8|0/-6:soft-knee=6:gain=4,"
+        f"loudnorm=I=-16:TP=-1.5:LRA=7[out]",
         "-map", "[out]",
         "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
         output_path
