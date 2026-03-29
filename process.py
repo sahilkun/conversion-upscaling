@@ -153,6 +153,30 @@ def fmt_vtt_time(seconds):
     return f"{h:02d}:{m:02d}:{s:06.3f}"
 
 
+def sanitize_text(text):
+    """Clean subtitle/TTS text to normalize expressive content.
+
+    Fixes stutters, repeated letters, excessive punctuation while preserving
+    meaning. Used for both subtitle display and TTS input.
+    """
+    # Protect ellipsis before collapsing repeated chars
+    text = text.replace('...', '\x00ELL\x00')
+    # Collapse repeated letters: "cuuumming" -> "cumming"
+    text = re.sub(r'([a-zA-Z])\1{2,}', r'\1\1', text)
+    # Restore ellipsis
+    text = text.replace('\x00ELL\x00', '...')
+    # Collapse repeated punctuation: "!!!" -> "!"
+    text = re.sub(r'!{2,}', '!', text)
+    text = re.sub(r'\?{2,}', '?', text)
+    # Remove stutter dashes: "I-I'm" -> "I'm"
+    text = re.sub(r'\b(\w)-\1', r'\1', text, flags=re.IGNORECASE)
+    # Normalize trailing "...!" to "..."
+    text = re.sub(r'\.\.\.!', '...', text)
+    # Clean up spacing
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+    return text
+
+
 def segment_subtitles(duration):
     """Convert ASS -> WebVTT, then segment into HLS-compatible VTT chunks."""
     subdir = os.path.join(OUT, "subs")
@@ -199,7 +223,7 @@ def segment_subtitles(duration):
             f.write(f"X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:00:00:00.000\n\n")
             for c in seg_cues:
                 f.write(f"{fmt_vtt_time(c['start'])} --> {fmt_vtt_time(c['end'])}\n")
-                f.write(f"{c['text']}\n\n")
+                f.write(f"{sanitize_text(c['text'])}\n\n")
         segment_files.append((i, seg_path, SEGMENT_DURATION))
 
     # Step 4: Write m3u8 playlist
@@ -295,17 +319,36 @@ def generate_gallery(src, duration):
     print(f"  Saved {GALLERY_COUNT} gallery screenshots to {gallerydir}/")
 
 
-def export_upscaled(src):
-    """Export a full upscaled 2160p video file (not HLS)."""
-    outpath = os.path.join(OUT, "2160p_full.mkv")
-    bitrate = 7700
+def export_download(src, variant, dub_audio=None):
+    """Export a full video file for download with optional dual audio.
+
+    Args:
+        src: Source MKV file
+        variant: "1080" or "2160"
+        dub_audio: Path to English dub WAV (or None for Japanese only)
+
+    Output: out/1080p_full.mkv or out/2160p_full.mkv
+    """
+    w, h, bitrate, abr = VARIANTS[variant]
+    outpath = os.path.join(OUT, f"{variant}p_full.mkv")
     maxrate = int(bitrate * 1.5)
     bufsize = maxrate
-    run([
+
+    # Use higher audio bitrate for download files
+    audio_br = "192k" if variant == "2160" else "160k"
+
+    cmd = [
         "ffmpeg", "-y",
         "-hwaccel", "cuda", "-hwaccel_output_format", "cuda",
         "-i", src,
-        "-vf", "scale_cuda=3840:2160:interp_algo=lanczos:format=yuv420p",
+    ]
+
+    # Add English dub as second input if available
+    if dub_audio and os.path.exists(dub_audio):
+        cmd += ["-i", dub_audio]
+
+    cmd += [
+        "-vf", f"scale_cuda={w}:{h}:interp_algo=lanczos:format=yuv420p",
         "-aspect", "16:9",
         "-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq",
         "-profile:v", "high",
@@ -315,31 +358,90 @@ def export_upscaled(src):
         "-spatial-aq", "1", "-temporal-aq", "1", "-aq-strength", "8",
         "-b_ref_mode", "middle", "-bf", "3", "-nonref_p", "1",
         "-r", FPS,
-        "-c:a", "aac", "-b:a", "192k", "-ac", "2",
-        "-sn",
-        outpath
-    ], "Export full upscaled 2160p video")
+    ]
+
+    if dub_audio and os.path.exists(dub_audio):
+        # Map: video from input 0, audio 1 (Japanese) from input 0, audio 2 (English) from input 1
+        cmd += [
+            "-map", "0:v:0",
+            "-map", "0:a:0",
+            "-map", "1:a:0",
+            "-c:a", "aac", "-b:a", audio_br, "-ac", "2",
+            "-metadata:s:a:0", "language=jpn",
+            "-metadata:s:a:0", "title=Japanese",
+            "-metadata:s:a:1", "language=eng",
+            "-metadata:s:a:1", "title=English Ai Dub",
+            "-disposition:a:0", "default",
+            "-disposition:a:1", "0",
+        ]
+    else:
+        cmd += ["-c:a", "aac", "-b:a", audio_br, "-ac", "2"]
+
+    cmd += ["-sn", outpath]
+
+    label = f"Export {variant}p download" + (" (dual audio)" if dub_audio else "")
+    run(cmd, label)
     print(f"  Saved {outpath}")
 
 
-def write_master_playlist():
+def run_dub_generator(ass_path, duration, src_mkv):
+    """Run dub_generate.py under Python 3.11 (required for XTTS v2 + Demucs)."""
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dub_generate.py")
+    if not os.path.exists(script):
+        print(f"ERROR: {script} not found")
+        return False
+
+    cmd = ["py", "-3.11", script, ass_path, str(duration), OUT, src_mkv]
+    voices_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voices")
+    if os.path.isdir(voices_dir):
+        cmd.append(voices_dir)
+
+    print(f"  Launching dub generator (Python 3.11 + XTTS v2 + Demucs)...")
+    try:
+        subprocess.run(cmd, check=True)
+        return True
+    except FileNotFoundError:
+        print("ERROR: Python 3.11 not found. Install it via: https://www.python.org/downloads/")
+        print("       Then install TTS + Demucs: py -3.11 -m pip install TTS demucs")
+        return False
+    except subprocess.CalledProcessError:
+        print("ERROR: Dub generation failed")
+        return False
+
+
+def write_master_playlist(has_dub=False):
     """Write the adaptive bitrate master playlist."""
-    content = """#EXTM3U
-#EXT-X-VERSION:6
-#EXT-X-INDEPENDENT-SEGMENTS
+    lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:6",
+        "#EXT-X-INDEPENDENT-SEGMENTS",
+        "",
+        '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",DEFAULT=YES,AUTOSELECT=YES,LANGUAGE="en",URI="subs/index_vtt.m3u8"',
+    ]
 
-#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",DEFAULT=YES,AUTOSELECT=YES,LANGUAGE="en",URI="subs/index_vtt.m3u8"
+    if has_dub:
+        lines += [
+            "",
+            '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Japanese",DEFAULT=YES,AUTOSELECT=YES,LANGUAGE="ja"',
+            '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English Ai Dub",DEFAULT=NO,AUTOSELECT=NO,LANGUAGE="en",URI="audio_en/index.m3u8"',
+        ]
 
-#EXT-X-STREAM-INF:BANDWIDTH=1628000,RESOLUTION=1280x720,CODECS="avc1.640028,mp4a.40.2",SUBTITLES="subs"
-720/index.m3u8
-#EXT-X-STREAM-INF:BANDWIDTH=3528000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2",SUBTITLES="subs"
-1080/index.m3u8
-#EXT-X-STREAM-INF:BANDWIDTH=7892000,RESOLUTION=3840x2160,CODECS="avc1.640028,mp4a.40.2",SUBTITLES="subs"
-2160/index.m3u8
-"""
+    audio_group = ',AUDIO="audio"' if has_dub else ""
+
+    lines += [
+        "",
+        f'#EXT-X-STREAM-INF:BANDWIDTH=1628000,RESOLUTION=1280x720,CODECS="avc1.640028,mp4a.40.2",SUBTITLES="subs"{audio_group}',
+        "720/index.m3u8",
+        f'#EXT-X-STREAM-INF:BANDWIDTH=3528000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2",SUBTITLES="subs"{audio_group}',
+        "1080/index.m3u8",
+        f'#EXT-X-STREAM-INF:BANDWIDTH=7892000,RESOLUTION=3840x2160,CODECS="avc1.640028,mp4a.40.2",SUBTITLES="subs"{audio_group}',
+        "2160/index.m3u8",
+        "",
+    ]
+
     path = os.path.join(OUT, "master.m3u8")
     with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+        f.write("\n".join(lines))
     print(f"Wrote {path}")
 
 
@@ -347,18 +449,20 @@ def main():
     parser = argparse.ArgumentParser(
         description="Video processing pipeline: MKV -> HLS with subtitles and thumbnails.",
         epilog="Examples:\n"
-               "  python process.py                      # run everything (HLS only, no upscale)\n"
+               "  python process.py                      # run everything (HLS only, no dub/download)\n"
                "  python process.py --only 720 1080      # only 720p + 1080p HLS\n"
                "  python process.py --only subs          # only subtitles\n"
                "  python process.py --only thumbs        # only thumbnails\n"
                "  python process.py --only gallery       # only gallery screenshots\n"
-               "  python process.py --only upscale       # only full 2160p upscaled video\n"
-               "  python process.py --only 2160 subs     # 2160p HLS + subtitles\n",
+               "  python process.py --only dub           # only English dub generation\n"
+               "  python process.py --only download      # 1080p + 4K MKVs with dual audio\n"
+               "  python process.py --only dub download  # generate dub + export download files\n"
+               "  python process.py --only 2160 subs dub # 2160p HLS + subtitles + dub\n",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
         "--only", nargs="+",
-        choices=["720", "1080", "2160", "subs", "thumbs", "gallery", "upscale"],
+        choices=["720", "1080", "2160", "subs", "thumbs", "gallery", "upscale", "dub", "download"],
         help="Run only the specified tasks (default: all)"
     )
     args = parser.parse_args()
@@ -366,28 +470,21 @@ def main():
     tasks = set(args.only) if args.only else {"720", "1080", "2160", "subs", "thumbs", "gallery"}
 
     # Phase 0: Detect inputs
-    need_video = tasks & {"720", "1080", "2160", "thumbs", "gallery", "upscale"}
-    need_subs = "subs" in tasks
+    need_video = tasks & {"720", "1080", "2160", "thumbs", "gallery", "upscale", "download"}
+    need_subs = "subs" in tasks or "dub" in tasks  # dub needs subtitles too
+    need_probe = need_video or need_subs
 
-    if need_video:
-        print("Phase 0: Detecting inputs...")
-        src_1080, src_2160 = detect_inputs()
-
-        # Phase 1: Probe video
-        print("\nPhase 1: Probing video...")
-        info = probe(src_1080)
-        print(f"  Duration: {info['duration']:.2f}s")
-        print(f"  Resolution: {info['width']}x{info['height']}")
-        print(f"  Framerate: {info['r_frame_rate']}")
-    elif need_subs:
-        # Subs-only still needs duration from probe
+    if need_probe:
         print("Phase 0: Detecting inputs...")
         src_1080, src_2160 = detect_inputs()
         print("\nPhase 1: Probing video...")
         info = probe(src_1080)
         print(f"  Duration: {info['duration']:.2f}s")
+        if need_video:
+            print(f"  Resolution: {info['width']}x{info['height']}")
+            print(f"  Framerate: {info['r_frame_rate']}")
 
-    # Phase 2: Extract subtitle (needed for subs or any video encode that might need it)
+    # Phase 2: Extract subtitle (needed for subs, dub, or any video encode)
     if need_subs:
         extract_subtitle(src_1080)
 
@@ -400,10 +497,10 @@ def main():
         src_4k = src_2160 if src_2160 else src_1080
         encode_hls(src_4k, "2160")
 
-    # Export full upscaled 2160p video
+    # Export full upscaled 2160p video (legacy, use 'download' instead)
     if "upscale" in tasks:
         src_up = src_2160 if src_2160 else src_1080
-        export_upscaled(src_up)
+        export_download(src_up, "2160")
 
     # Phase 6: Subtitle segmentation
     if "subs" in tasks:
@@ -417,10 +514,39 @@ def main():
     if "gallery" in tasks:
         generate_gallery(src_1080, info["duration"])
 
+    # Phase 9: English dub generation via XTTS v2
+    has_dub = False
+    if "dub" in tasks:
+        has_dub = run_dub_generator("subtitle.ass", info["duration"], src_1080)
+
+    # Auto-detect existing dub from previous run
+    if not has_dub and os.path.isdir(os.path.join(OUT, "audio_en")):
+        has_dub = True
+
+    # Phase 10: Export full download files (1080p + 4K MKV with dual audio)
+    if "download" in tasks:
+        # Check if English dub exists (from current or previous run)
+        dub_wav = os.path.join(OUT, "dub_work", "english_dub.wav")
+        if not os.path.exists(dub_wav):
+            dub_wav = None
+            print("  Note: No English dub found. Download files will have Japanese audio only.")
+            print("        Run with '--only dub download' to include English dub.")
+
+        print("\nExporting download files...")
+        # 1080p download
+        export_download(src_1080, "1080", dub_audio=dub_wav)
+        # 4K download (from 2160p source, or upscaled from 1080p)
+        src_4k = src_2160 if src_2160 else src_1080
+        export_download(src_4k, "2160", dub_audio=dub_wav)
+
     # Phase 8: Master playlist (only when running all video encodes)
     if {"720", "1080", "2160"} <= tasks:
         print("\nPhase 8: Writing master playlist...")
-        write_master_playlist()
+        write_master_playlist(has_dub=has_dub)
+    elif has_dub and os.path.exists(os.path.join(OUT, "master.m3u8")):
+        # Re-write master playlist to include dub audio group
+        print("\nUpdating master playlist with English dub audio...")
+        write_master_playlist(has_dub=True)
 
     print(f"\nDone! Output in {OUT}/")
 

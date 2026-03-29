@@ -1,0 +1,189 @@
+# Label each line: F = female (Sachi), M = male (boy)
+# Just put F or M at the start of each line
+# Lines 0-1 are disclaimers - skip
+# Save when done, then run: py -3.11 prepare_training.py --labels speaker_labels.txt
+F 002 [00:23] Why don't you hook up? 
+F 003 [00:27] Jeez!
+F 004 [00:31] Hey.
+F 005 [00:33] I'm talking to you!
+F 006 [00:36] Don't ignore me!
+M 007 [00:39] What's going on?
+F 008 [00:41] This phone doesn't connect!
+F 009 [00:45] You're a kid from here, right?
+M 010 [00:48] I've never seen anyone use it.
+F 011 [00:52] That's why I hate the countryside.
+M 012 [00:54] Where do you want to call?
+F 013 [00:57] If you know it's small, why are you coming in?
+M 014 [01:00] You called me, didn't you?
+M 015 [01:05] Who are you?
+F 016 [01:08] My name is Sachi.
+F 017 [01:10] I'm the granddaughter of the Seno family.
+F 018 [01:12] Well, my parents ran away to get married, so we don't know each other.
+F 019 [01:16] I've heard that Koukou-san has passed away, so I've come instead of my mother.
+M 020 [01:21] Seno is my family.
+F 021 [01:23] Then take me there.
+M 022 [01:26] I want to go to my friend's house, you know?
+F 023 [01:28] A-Ah!
+F 024 [01:30] You dropped something.
+F 025 [01:32] Erotic Manga You... this is...
+F 026 [01:37] Even if you're a child, all boys are the same.
+M 027 [01:40] I was going to his house to
+M 028 [01:41] return what I borrowed...! Huh?
+F 029 [01:44] Looks like something's blocking the door.
+M 030 [01:47] Ah, my net to catch insects...
+M 031 [01:50] Looks like we need to open it from the outside.
+F 032 [01:54] Huh?
+F 033 [01:58] Ah...
+M 034 [02:00] Don't read without my permission...!
+F 035 [02:01] How is it possible that a Madonna like me...
+F 036 [02:02] ...was locked up with this pervert child?
+F 037 [02:05] My purity is in danger!
+M 038 [02:08] Geez! It's so hot!
+F 039 [02:11] W-Why are you undressing?
+M 040 [02:14] You take off your clothes too!
+M 041 [02:15] It'll give you a heat blow.
+F 042 [02:17] Impossible!
+F 043 [02:18] I don't feel any hot here! And besides, someone could come any moment!
+M 044 [02:24] Seeing a brat like you naked doesn't excite me at all.
+F 045 [02:28] You're stubborn!
+M 046 [02:31] You're a pain in the ass!
+F 047 [02:33] Hot! Hot!
+M 048 [02:36] Don't complicate things for me.
+F 049 [02:38] All right! I'll undress!
+F 050 [02:42] Although I'm the most popular girl in school...
+M 051 [02:45] You're too narcissistic.
+F 052 [02:47] Don't look over here!
+F 053 [02:53] Oh, but...
+F 054 [02:56] It feels cool!
+F 055 [02:58] If I had known, I should have undressed a lot earlier...
+F 056 [03:03] Hey.
+F 057 [03:03] Don't stare that much at me!
+M 058 [03:06] No, I'm not looking at you.
+F 059 [03:10] Liar!
+F 060 [03:12] You're looking me!
+F 061 [03:21] No!
+F 062 [03:23] There's an insect!
+F 063 [03:25] I can't!
+F 064 [03:29] No!
+F 065 [03:36] Do something!
+F 066 [03:41] No!
+F 067 [03:43] That's why I hate the countryside!
+F 068 [03:46] Hey! You...!
+F 069 [03:48] We have to get out of here!
+M 070 [03:52] Y-Yes!
+F 071 [04:08] Just... a little... more...!
+F 072 [04:17] Hey?
+F 073 [04:19] You touched my chest!
+M 074 [04:22] I'm sorry, I have no balance.
+F 075 [04:26] Be careful, please!
+M 076 [04:30] The scent of a girl...
+M 077 [04:33] It's delicious, isn't it?
+F 078 [04:42] Did you do something right now?
+M 079 [04:45] No! I didn't...
+M 080 [04:47] ...nothing, really.
+F 081 [04:49] Is that true?
+F 082 [04:56] Sunlight is getting more intense.
+F 083 [05:05] If we don't get out soon, we may both melt!
+F 084 [05:10] Y-Yes!
+F 085 [05:13] I just need a little more to reach it!
+F 086 [05:22] Hey!
+F 087 [05:26] How long are you gonna keep touching me?
+M 088 [05:29] I'm not...!
+M 089 [05:36] Are you okay?
+M 090 [05:38] It's still hot after we get undressed.
+M 091 [05:42] If we don't open soon, we could burn!
+F 092 [05:45] You worry too much.
+M 093 [05:48] But...!
+F 094 [05:50] Huh?
+F 095 [05:51] You... that's...
+M 096 [05:54] It's because our bodies were touching.
+M 097 [06:01] I really care about you.
+F 098 [06:08] I-I get it.
+F 099 [06:11] Why are you standing there?
+F 100 [06:14] We need to get out of here immediately.
+F 101 [06:21] Don't turn around, please!
+M 102 [06:24] I get it!
+F 103 [06:26] As I thought, that's more stable.
+F 104 [06:30] A little more...
+M 105 [06:32] Her nipples are rubbing...
+M 106 [06:37] ...my back.
+M 107 [06:43] Her whole body is so soft!
+F 108 [06:47] I'm so close...!
+F 109 [06:50] Hey! Don't move!
+F 110 [06:57] Huh?
+M 111 [06:58] Don't touch me!
+F 112 [07:02] I just touched it by chance...
+F 113 [07:04] Why are you reacting like that?
+M 114 [07:07] I can say the same...
+F 115 [07:09] You touched me, didn't you?
+M 116 [07:17] You...!
+M 117 [07:39] She did it on her own...!
+F 118 [07:52] Hey, you want to see my vagina?
+M, F 119 [08:04] One, two...
+F 120 [08:13] That... you...
+M 121 [08:16] Haven't you ever seen someone else's naked body, apart from your family?
+F 122 [08:20] Of course!
+F 123 [08:24] You've only seen them in porn magazines, haven't you?
+M 124 [08:28] Shut up!
+F 125 [08:29] Don't you look too much?
+M 126 [08:31] You too!
+F,M 127 [08:34] Do you want to touch it?
+M 128 [08:48] Try to touch it better.
+F 129 [08:50] You too, put it further inside.
+M 130 [08:56] Do the girls do this too?
+F 131 [09:01] It's because I'm hot.
+F 132 [09:04] So, well, you want to put it in a little bit?
+M 133 [09:12] I'm gonna put it in.
+F 134 [09:16] Just the tip, okay?
+M 135 [09:21] I can't stick it in!
+F 136 [09:25] What a drag!
+F 137 [09:27] This is the place!
+F 138 [09:29] Put it in here!
+F 139 [09:32] This is embarrassing, so hurry up!
+M 140 [09:36] This time...
+F 141 [09:39] Just the tip, understand?
+M 142 [09:41] I get it!
+F 143 [09:45] Stop!
+F 144 [09:47] That's enough!
+M 145 [09:50] J-Just this?
+F 146 [09:52] We agreed only "the tip"!
+M 147 [09:58] I understand, but...
+F,M 148 [10:03] This is awkward!
+M 149 [10:08] Hey, you're suffering, too, aren't you?
+F 150 [10:12] Yeah, but...
+F 151 [10:16] We can only have sex when we're adults... Shut up!
+M 152 [10:21] Someone's coming!
+F 153 [10:22] In a situation like this?
+M 154 [10:24] If we don't bend over, they can see us!
+M 155 [10:29] Hold on a second...
+M 156 [10:33] We're safe now.
+F 157 [10:37] What's safe?
+F 158 [10:40] You... You put it all in me!
+M 159 [10:46] I-I'm sorry!
+M 160 [10:48] I'll pull it out immediately.
+F 161 [10:51] That's enough.
+F 162 [10:53] You put it in, it can't be helped.
+F 163 [10:57] So...
+M 164 [11:19] It's so hot in and out that I'm gonna melt!
+F 165 [11:27] I didn't give you permission with my breasts!
+M 166 [11:30] Shut up! How could I endure!
+F 167 [11:35] This is weird, though we don't know each other, we're having sex.
+M 168 [11:43] You're enjoying it too, aren't you?
+F 169 [11:48] It's because of this hot!
+M 170 [11:56] Don't push me!
+F 171 [11:59] It feels good!
+M 172 [12:04] I'm not losing!
+F 173 [12:07] You...!
+F 174 [12:09] Being so cocky!
+F 175 [12:16] Don't be so rude!
+M 176 [12:22] Ah... no more... s-something's gonna come out...
+F 177 [12:28] I-I'm gonna cum too...
+F 178 [12:32] Together, like this...!
+F 179 [12:45] I-It's coming!
+M 180 [12:54] This is crazy! It feels too good!
+F 181 [12:57] I felt good, too!
+F 182 [13:12] Looks like no one's coming.
+M 183 [13:16] Ah, the trap net has taken off.
+M 184 [13:24] Do you want to keep doing it in my house?
+F 185 [13:27] I'm kidding.
+F 186 [13:35] Yeah.

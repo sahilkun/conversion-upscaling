@@ -1,0 +1,67 @@
+process.py - Video Processing Pipeline
+=======================================
+
+Usage: python process.py [--only TASK [TASK ...]]
+
+Tasks: 720, 1080, 2160, subs, thumbs, gallery, upscale
+
+
+COMMANDS & OUTPUT
+=================
+
+python process.py
+  Runs: 720p + 1080p + 2160p HLS, subtitles, thumbnails, gallery, master playlist
+  Output: out/720/  out/1080/  out/2160/  out/subs/  out/thumbs/  out/gallery/  out/master.m3u8
+
+python process.py --only 720
+  Runs: 720p HLS only
+  Output: out/720/
+
+python process.py --only 1080
+  Runs: 1080p HLS only
+  Output: out/1080/
+
+python process.py --only 2160
+  Runs: 2160p HLS only
+  Output: out/2160/
+
+python process.py --only 720 1080
+  Runs: 720p + 1080p HLS
+  Output: out/720/  out/1080/
+
+python process.py --only 720 1080 2160
+  Runs: All HLS + master playlist
+  Output: out/720/  out/1080/  out/2160/  out/master.m3u8
+
+python process.py --only subs
+  Runs: Subtitle segmentation only
+  Output: out/subs/
+
+python process.py --only thumbs
+  Runs: Seek thumbnails only
+  Output: out/thumbs/
+
+python process.py --only gallery
+  Runs: Gallery screenshots only (10 x 1080p WebP)
+  Output: out/gallery/
+
+python process.py --only upscale
+  Runs: Full 2160p upscaled video (not HLS)
+  Output: out/2160p_full.mkv
+
+python process.py --only upscale 2160
+  Runs: Full 2160p video + 2160p HLS
+  Output: out/2160p_full.mkv  out/2160/
+
+python process.py --only 720 subs thumbs gallery
+  Runs: 720p HLS + subtitles + thumbnails + gallery
+  Output: out/720/  out/subs/  out/thumbs/  out/gallery/
+
+
+NOTES
+=====
+- Master playlist (out/master.m3u8) is only written when all 3 resolutions are included.
+- "upscale" is never included by default — must be explicitly requested.
+- If no 2160p source MKV is found, 1080p is upscaled via Lanczos on GPU.
+- Gallery captures 10 evenly-spaced screenshots, skipping first/last 5% to avoid intros/outros.
+- Gallery images are 1920x1080 WebP, typically 30-80 KB each.
