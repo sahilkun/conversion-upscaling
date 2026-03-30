@@ -38,7 +38,7 @@ nltk_path = os.path.join(os.path.dirname(__file__), "GPT-SoVITS", "nltk_data")
 if os.path.isdir(nltk_path):
     os.environ["NLTK_DATA"] = nltk_path
 
-WORKDIR = "out/dub_work"
+WORKDIR = "dub_work"
 SAMPLE_RATE = 32000  # GPT-SoVITS outputs 32kHz
 
 
@@ -54,7 +54,7 @@ def parse_ass(path):
         if len(parts) < 10:
             continue
         style = parts[3].strip()
-        if style.lower() in ("sign", "signs", "credits", "credit", "note"):
+        if style.lower() in ("sign", "signs", "credits", "credit", "note", "ed", "op"):
             continue
         def to_sec(ts):
             h, m, s = ts.strip().split(":")
@@ -90,9 +90,22 @@ def load_speaker_labels(labels_path, dialogues):
                 idx = int(match.group(2))
                 labels[idx] = speaker
 
-    # Assign labels to dialogues
-    for i, d in enumerate(dialogues):
-        d["speaker"] = labels.get(i + 2, "female")  # +2 offset for disclaimer lines
+    # Assign labels to dialogues — match by sequential index
+    # Labels file uses 1-based numbering including non-dialogue lines
+    # We need to find which label indices correspond to actual dialogue lines
+    # Strategy: the labels dict maps label_line_number -> speaker
+    # Dialogue lines are numbered sequentially starting from the first labeled line
+    labeled_indices = sorted(labels.keys())
+    dialogue_idx = 0
+    for label_idx in labeled_indices:
+        if dialogue_idx < len(dialogues):
+            dialogues[dialogue_idx]["speaker"] = labels[label_idx]
+            dialogue_idx += 1
+
+    # Any remaining dialogues without labels default to female
+    for d in dialogues:
+        if "speaker" not in d:
+            d["speaker"] = "female"
 
     f_count = sum(1 for d in dialogues if d["speaker"] == "female")
     m_count = sum(1 for d in dialogues if d["speaker"] == "male")
@@ -284,30 +297,22 @@ def generate_clips(tts, dialogues, speaker_refs):
                 "speed_factor": 1.0,
             }
 
-            # Try up to 3 times with different seeds if output is weak
-            for attempt in range(3):
-                if attempt > 0:
-                    inputs["seed"] = 42 + attempt * 100
-                for sr, audio in tts.run(inputs):
-                    sf.write(clip_path, audio, sr)
-                    break
-                # Quality check — peak + duration sanity
-                if os.path.exists(clip_path):
-                    import struct as _struct
-                    with wave.open(clip_path, "rb") as _wf:
-                        _nframes = _wf.getnframes()
-                        _sr = _wf.getframerate()
-                        _raw = _wf.readframes(_nframes)
-                    _clip_dur = _nframes / _sr
-                    _samples = _struct.unpack(f"<{len(_raw)//2}h", _raw)
-                    _peak = max(abs(s) for s in _samples) if _samples else 0
-                    # Fail if: too quiet, or way too long (repetition loop)
-                    _max_expected = max(d["duration"] * 2.5, len(tts_text.split()) * 0.8)
-                    if _peak >= 6000 and _clip_dur <= _max_expected:
-                        break  # Good clip
-                    elif attempt < 2:
-                        os.remove(clip_path)
-                        continue  # Retry
+            # Generate clip — same seed always for voice consistency
+            for sr, audio in tts.run(inputs):
+                sf.write(clip_path, audio, sr)
+                break
+
+            # Quality check — discard if repetition loop (way too long)
+            if os.path.exists(clip_path):
+                import struct as _struct
+                with wave.open(clip_path, "rb") as _wf:
+                    _nframes = _wf.getnframes()
+                    _sr = _wf.getframerate()
+                _clip_dur = _nframes / _sr
+                _max_expected = max(d["duration"] * 2.5, len(tts_text.split()) * 0.8)
+                if _clip_dur > _max_expected:
+                    os.remove(clip_path)
+                    continue  # Skip this line rather than retry with different voice
 
             if os.path.exists(clip_path) and os.path.getsize(clip_path) > 1000:
                 manifest.append({
@@ -497,9 +502,16 @@ def main():
     parser.add_argument("--subs", default="subtitle hentaiclick.ass")
     parser.add_argument("--labels", default="speaker_labels.txt")
     parser.add_argument("--src", default=None, help="Source MKV (for Demucs)")
-    parser.add_argument("--output", default="out/dub_work/english_dub.wav")
+    parser.add_argument("--output", default="dub_work/english_dub.wav")
+    parser.add_argument("--workdir", default=None, help="Working directory (default: derived from output)")
     parser.add_argument("--no-cache", action="store_true")
     args = parser.parse_args()
+
+    global WORKDIR
+    if args.workdir:
+        WORKDIR = args.workdir
+    else:
+        WORKDIR = os.path.dirname(args.output) or "dub_work"
 
     os.makedirs(WORKDIR, exist_ok=True)
 

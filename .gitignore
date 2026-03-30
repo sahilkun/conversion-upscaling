@@ -11,6 +11,9 @@
 # Output directory
 out/
 
+# Dub working files
+dub_work/
+
 # Python
 __pycache__/
 *.pyc
