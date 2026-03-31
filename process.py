@@ -48,6 +48,21 @@ def probe(path):
     }
 
 
+def verify_duration(output_path, expected_duration, label):
+    """Check encoded output duration matches source. Warn if >2s difference."""
+    try:
+        info = probe(output_path)
+        diff = abs(info["duration"] - expected_duration)
+        if diff > 2.0:
+            print(f"\n  *** WARNING: {label} duration mismatch! ***")
+            print(f"  *** Expected {expected_duration:.1f}s, got {info['duration']:.1f}s (diff: {diff:.1f}s) ***\n")
+            return False
+        print(f"  {label} duration OK: {info['duration']:.1f}s")
+        return True
+    except Exception:
+        return True
+
+
 def detect_inputs():
     """Find 1080p and optional 2160p MKV files in working directory."""
     mkvs = glob.glob("*.mkv")
@@ -70,6 +85,78 @@ def detect_inputs():
     return src_1080, src_2160
 
 
+def clean_subtitle(ass_path):
+    """Strip third-party branding and add hentaiclick.tv credit to ASS subtitle."""
+    with open(ass_path, "r", encoding="utf-8-sig") as f:
+        content = f.read()
+
+    # Remove lines mentioning other groups/sites (case-insensitive)
+    strip_patterns = [
+        r"(?i)amateursubs?",
+        r"(?i)hstream\.moe",
+        r"(?i)hstream",
+    ]
+    lines = content.split("\n")
+    cleaned = []
+    for line in lines:
+        skip = False
+        # Strip any Dialogue/Comment line mentioning third-party names
+        if line.startswith("Dialogue:") or line.startswith("Comment:"):
+            text_part = line.split(",", 9)[-1] if "," in line else line
+            for pat in strip_patterns:
+                if re.search(pat, text_part):
+                    skip = True
+                    break
+        # Also strip from Style lines (e.g. style named after the group)
+        elif line.startswith("Style:"):
+            for pat in strip_patterns:
+                if re.search(pat, line):
+                    skip = True
+                    break
+        if not skip:
+            cleaned.append(line)
+
+    # Find the last dialogue end time to place branding after it
+    last_end = 0
+    time_pat = r"Dialogue:\s*\d+,(\d+:\d{2}:\d{2}\.\d{2}),(\d+:\d{2}:\d{2}\.\d{2}),"
+    for line in cleaned:
+        m = re.match(time_pat, line)
+        if m:
+            # Parse ASS timestamp H:MM:SS.CC
+            parts = m.group(2).split(":")
+            t = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+            if t > last_end:
+                last_end = t
+
+    # Replace Title in [Script Info] section
+    result = "\n".join(cleaned)
+    result = re.sub(r"(?m)^Title:.*$", "Title: Upscaled and dubbed by hentaiclick.tv", result)
+
+    # Add visible branding line 5 seconds after last dialogue
+    if last_end > 0:
+        brand_start = last_end + 5
+        brand_end = brand_start + 5
+        def fmt_ass_time(s):
+            h = int(s // 3600)
+            m = int((s % 3600) // 60)
+            sec = s % 60
+            return f"{h}:{m:02d}:{sec:05.2f}"
+        brand_line = (
+            f"Dialogue: 0,{fmt_ass_time(brand_start)},{fmt_ass_time(brand_end)},Default,,0,0,0,,"
+            f"{{\\an8\\fs28\\c&HFFFFFF&\\3c&H000000&\\bord2}}Upscaled and dubbed by hentaiclick.tv"
+        )
+        # Insert before the last line (which is usually empty or [End])
+        if result.rstrip().endswith(""):
+            result = result.rstrip() + "\n" + brand_line + "\n"
+        else:
+            result += "\n" + brand_line + "\n"
+        print(f"  Added branding subtitle at {fmt_ass_time(brand_start)} - {fmt_ass_time(brand_end)}")
+
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(result)
+    print("  Cleaned subtitle: stripped third-party mentions, added hentaiclick.tv branding")
+
+
 def extract_subtitle(src):
     """Extract first subtitle stream as ASS."""
     if os.path.exists("subtitle.ass"):
@@ -80,6 +167,7 @@ def extract_subtitle(src):
         "-map", "0:s:0", "-c:s", "copy",
         "subtitle.ass"
     ], "Phase 2: Extract subtitle")
+    clean_subtitle("subtitle.ass")
 
 
 def _nvenc_flags(bitrate, audio_bitrate):
@@ -288,6 +376,14 @@ def generate_thumbnails(src, duration):
 
 GALLERY_COUNT = 10  # Number of gallery screenshots
 
+# Download MKV settings (LOCKED — matched to hstream quality)
+# hstream uses AV1 1080p @ 1.74 Mbps, HEVC 2160p @ 6.4 Mbps
+# H.264 equivalents account for ~30-40% efficiency gap vs AV1/HEVC
+DOWNLOAD_SETTINGS = {
+    "1080": {"cq": "23", "bitrate": 3400, "maxrate": 5100, "bufsize": 5100},
+    "2160": {"cq": "24", "bitrate": 8000, "maxrate": 12000, "bufsize": 12000},
+}
+
 
 def generate_gallery(src, duration):
     """Capture evenly-spaced gallery screenshots as 1080p WebP."""
@@ -299,10 +395,10 @@ def generate_gallery(src, duration):
     usable_start = margin
     usable_end = duration - margin
     usable_duration = usable_end - usable_start
-    interval = usable_duration / (GALLERY_COUNT + 1)
+    interval = usable_duration / max(GALLERY_COUNT - 1, 1)
 
     for i in range(GALLERY_COUNT):
-        timestamp = usable_start + interval * (i + 1)
+        timestamp = usable_start + interval * i
         outpath = os.path.join(gallerydir, f"gallery_{i}.webp")
         run([
             "ffmpeg", "-y",
@@ -329,13 +425,9 @@ def export_download(src, variant, dub_audio=None):
 
     Output: out/1080p_full.mkv or out/2160p_full.mkv
     """
-    w, h, bitrate, abr = VARIANTS[variant]
+    w, h = VARIANTS[variant][:2]
+    dl = DOWNLOAD_SETTINGS[variant]
     outpath = os.path.join(OUT, f"{variant}p_full.mkv")
-    maxrate = int(bitrate * 1.5)
-    bufsize = maxrate
-
-    # Use higher audio bitrate for download files
-    audio_br = "192k" if variant == "2160" else "160k"
 
     cmd = [
         "ffmpeg", "-y",
@@ -352,8 +444,8 @@ def export_download(src, variant, dub_audio=None):
         "-aspect", "16:9",
         "-c:v", "h264_nvenc", "-preset", "p6", "-tune", "hq",
         "-profile:v", "high",
-        "-rc:v", "vbr", "-cq", "26",
-        "-b:v", f"{bitrate}k", "-maxrate", f"{maxrate}k", "-bufsize", f"{bufsize}k",
+        "-rc:v", "vbr", "-cq", dl["cq"],
+        "-b:v", f"{dl['bitrate']}k", "-maxrate", f"{dl['maxrate']}k", "-bufsize", f"{dl['bufsize']}k",
         "-multipass", "fullres", "-rc-lookahead", "20",
         "-spatial-aq", "1", "-temporal-aq", "1", "-aq-strength", "8",
         "-b_ref_mode", "middle", "-bf", "3", "-nonref_p", "1",
@@ -361,12 +453,13 @@ def export_download(src, variant, dub_audio=None):
     ]
 
     if dub_audio and os.path.exists(dub_audio):
-        # Map: video from input 0, audio 1 (Japanese) from input 0, audio 2 (English) from input 1
         cmd += [
             "-map", "0:v:0",
             "-map", "0:a:0",
             "-map", "1:a:0",
-            "-c:a", "aac", "-b:a", audio_br, "-ac", "2",
+            "-map", "0:s:0?",
+            "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+            "-c:s", "copy",
             "-metadata:s:a:0", "language=jpn",
             "-metadata:s:a:0", "title=Japanese",
             "-metadata:s:a:1", "language=eng",
@@ -375,9 +468,15 @@ def export_download(src, variant, dub_audio=None):
             "-disposition:a:1", "0",
         ]
     else:
-        cmd += ["-c:a", "aac", "-b:a", audio_br, "-ac", "2"]
+        cmd += [
+            "-map", "0:v:0",
+            "-map", "0:a:0",
+            "-map", "0:s:0?",
+            "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+            "-c:s", "copy",
+        ]
 
-    cmd += ["-sn", outpath]
+    cmd += [outpath]
 
     label = f"Export {variant}p download" + (" (dual audio)" if dub_audio else "")
     run(cmd, label)
@@ -491,11 +590,14 @@ def main():
     # Phase 3-5: HLS encoding
     if "720" in tasks:
         encode_hls(src_1080, "720")
+        verify_duration(os.path.join(OUT, "720", "index.m3u8"), info["duration"], "720p HLS")
     if "1080" in tasks:
         encode_hls(src_1080, "1080")
+        verify_duration(os.path.join(OUT, "1080", "index.m3u8"), info["duration"], "1080p HLS")
     if "2160" in tasks:
         src_4k = src_2160 if src_2160 else src_1080
         encode_hls(src_4k, "2160")
+        verify_duration(os.path.join(OUT, "2160", "index.m3u8"), info["duration"], "2160p HLS")
 
     # Export full upscaled 2160p video (legacy, use 'download' instead)
     if "upscale" in tasks:
@@ -535,9 +637,11 @@ def main():
         print("\nExporting download files...")
         # 1080p download
         export_download(src_1080, "1080", dub_audio=dub_wav)
+        verify_duration(os.path.join(OUT, "1080p_full.mkv"), info["duration"], "1080p download")
         # 4K download (from 2160p source, or upscaled from 1080p)
         src_4k = src_2160 if src_2160 else src_1080
         export_download(src_4k, "2160", dub_audio=dub_wav)
+        verify_duration(os.path.join(OUT, "2160p_full.mkv"), info["duration"], "2160p download")
 
     # Phase 8: Master playlist (only when running all video encodes)
     if {"720", "1080", "2160"} <= tasks:
