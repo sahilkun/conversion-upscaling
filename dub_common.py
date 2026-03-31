@@ -469,7 +469,11 @@ def postprocess_clips(manifest):
 
 
 def time_stretch_clips(manifest):
-    """Pitch-preserving time-stretch for clips exceeding target duration."""
+    """Pitch-preserving time-stretch for clips exceeding target duration.
+
+    Uses FFmpeg atempo (0.5–2.0x). For ratios >2.0x, chains two atempo filters.
+    Removes the 1.15x cap — will stretch up to 2.0x to fit subtitle window.
+    """
     print("\n=== Time-stretching long clips ===")
     stretched = 0
 
@@ -481,14 +485,22 @@ def time_stretch_clips(manifest):
             continue
 
         target = m["target_duration"]
-        if dur > target * 1.2 and target > 0.3:
-            ratio = min(dur / target, 1.15)
+        if dur > target * 1.1 and target > 0.3:
+            ratio = dur / target
+            ratio = min(ratio, 4.0)  # hard cap: never compress more than 4x
+
+            # atempo is capped at 2.0; chain two filters if needed
+            if ratio <= 2.0:
+                af = f"atempo={ratio:.4f}"
+            else:
+                # e.g. ratio=3.0 -> atempo=1.732,atempo=1.732 (sqrt(3))
+                r1 = ratio ** 0.5
+                af = f"atempo={r1:.4f},atempo={r1:.4f}"
+
             tmp = clip + ".tempo.wav"
             try:
                 subprocess.run([
-                    "ffmpeg", "-y", "-i", clip,
-                    "-af", f"atempo={ratio:.3f}",
-                    tmp
+                    "ffmpeg", "-y", "-i", clip, "-af", af, tmp
                 ], check=True, capture_output=True)
                 if os.path.exists(tmp) and os.path.getsize(tmp) > 500:
                     os.replace(tmp, clip)
@@ -497,7 +509,7 @@ def time_stretch_clips(manifest):
                 if os.path.exists(tmp):
                     os.remove(tmp)
 
-    print(f"  Stretched {stretched} clips (max 1.15x, pitch preserved)")
+    print(f"  Stretched {stretched} clips (pitch-preserving atempo, up to 4x)")
     return stretched
 
 
@@ -536,14 +548,6 @@ def assemble_voice_track(manifest, total_duration, workdir, sample_rate=44100):
             new_len = int(len(samples) * ratio)
             samples = [samples[min(int(j / ratio), len(samples)-1)] for j in range(new_len)]
 
-        # In-memory time-stretch if too long
-        clip_dur = len(samples) / sample_rate
-        target_dur = m["target_duration"]
-        if clip_dur > target_dur * 1.1 and target_dur > 0.3:
-            ratio = clip_dur / target_dur
-            new_len = int(len(samples) / ratio)
-            samples = [samples[min(int(j * ratio), len(samples)-1)] for j in range(new_len)]
-
         # Place on timeline
         start_sample = int(m["start"] * sample_rate)
         for j, s in enumerate(samples):
@@ -581,27 +585,50 @@ def assemble_voice_track(manifest, total_duration, workdir, sample_rate=44100):
 
 # ── Audio Mixing ──────────────────────────────────────────────────────────────
 
+def _build_duck_filter(duck_points, vol_normal=0.7, vol_duck=0.08, fade=0.05):
+    """Build an FFmpeg volume expression with smooth 50ms fade in/out ramps.
+
+    Each segment uses a trapezoid envelope:
+      rise over [s-fade, s], hold over [s, e], fall over [e, e+fade].
+    Expressed as: max(0,min(1,(t-s)/fade+1)) * max(0,min(1,(e-t)/fade+1))
+    All segments summed and clamped to [0,1] to handle adjacent lines.
+    Final volume: vol_normal - (vol_normal - vol_duck) * duck_factor
+    """
+    if not duck_points:
+        return f"volume={vol_normal}"
+
+    F = fade
+    seg_exprs = [
+        f"max(0,min(1,(t-{s:.3f})/{F}+1))*max(0,min(1,({e:.3f}-t)/{F}+1))"
+        for s, e in duck_points
+    ]
+    sum_expr = "+".join(seg_exprs)
+    duck_range = vol_normal - vol_duck  # 0.62
+    return f"volume='{vol_normal}-{duck_range:.4f}*min(1,{sum_expr})':eval=frame"
+
+
 def mix_audio(voice_path, vocals_path, bg_path, manifest, output_path):
     """Mix English voice + ducked Japanese vocals + background.
 
     Smart ducking: JP vocals muted during English speech, audible between.
+    Smooth 50ms fade in/out ramps on duck transitions.
+    Voice gets pseudo-stereo widening (haas effect) to avoid flat mono sound.
     Background music always present at moderate level.
     """
     print("\n=== Mixing final audio ===")
 
     duck_points = [(m["start"], m["start"] + m["target_duration"]) for m in manifest]
-
-    if duck_points:
-        parts = [f"between(t,{s:.2f},{e:.2f})" for s, e in duck_points]
-        duck_expr = "+".join(parts)
-        vocal_filter = (
-            f"volume='if({duck_expr},0.08,0.7)':eval=frame,"
-            f"afade=t=in:st=0:d=0.5"
-        )
-    else:
-        vocal_filter = "volume=0.7"
+    vocal_filter = _build_duck_filter(duck_points)
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    # Pseudo-stereo (haas): original on left, 20ms delayed copy on right
+    # Creates natural space without changing timbre
+    voice_stereo = (
+        "[0]asplit[vl][vr];"
+        "[vr]adelay=20[vrd];"
+        "[vl][vrd]amerge,volume=2.0[en]"
+    )
 
     subprocess.run([
         "ffmpeg", "-y",
@@ -609,7 +636,7 @@ def mix_audio(voice_path, vocals_path, bg_path, manifest, output_path):
         "-i", vocals_path,
         "-i", bg_path,
         "-filter_complex",
-        f"[0]aformat=sample_rates=44100:channel_layouts=stereo,volume=2.0[en];"
+        f"{voice_stereo};"
         f"[1]{vocal_filter}[ja];"
         f"[2]volume=0.8[bg];"
         f"[en][ja][bg]amix=inputs=3:duration=longest:normalize=0,"
