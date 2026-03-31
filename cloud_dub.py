@@ -26,6 +26,10 @@ import sys
 import wave
 import requests
 
+# Import shared utilities
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import dub_common
+
 # ── Config ──────────────────────────────────────────────────────────────────
 API_URL = "http://127.0.0.1:8080"
 WORKDIR = os.path.join("out", "dub_work")
@@ -778,25 +782,14 @@ def main():
         sys.exit(1)
 
     # Auto-detect source MKV
-    if args.src:
-        src = args.src
-    else:
-        for f in os.listdir("."):
-            if f.endswith(".mkv") and "1080" in f.lower():
-                src = f
-                break
-        else:
-            print("  ERROR: No 1080p MKV found!")
-            sys.exit(1)
+    src = args.src or dub_common.find_mkv_1080()
+    if not src:
+        print("  ERROR: No 1080p MKV found! Use --src")
+        sys.exit(1)
     print(f"Source: {src}")
 
     # Probe duration
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", src],
-        capture_output=True, text=True
-    )
-    total_duration = float(result.stdout.strip())
+    total_duration = dub_common.probe_duration(src)
     print(f"Duration: {total_duration:.1f}s ({total_duration/60:.1f} min)")
 
     # Clear cache if requested
@@ -809,14 +802,15 @@ def main():
 
     # Step 1: Parse subtitles
     print("\n=== Step 1: Parse subtitles ===")
-    dialogues = parse_ass(args.subs)
+    dialogues = dub_common.parse_ass(args.subs)
 
-    # Step 2: Assign speakers
+    # Step 2: Assign speakers (auto-detect, or manual labels if file exists)
     print("\n=== Step 2: Assign speakers ===")
-    dialogues = assign_speakers(dialogues)
+    labels_path = "speaker_labels.txt" if os.path.isfile("speaker_labels.txt") else None
+    dialogues = dub_common.assign_speakers(dialogues, labels_path=labels_path)
 
     # Step 3: Separate audio
-    vocals, bg = separate_audio(src)
+    vocals, bg = dub_common.separate_audio(src, WORKDIR)
 
     # Step 4: Extract CALM references per speaker
     speaker_refs = extract_references(dialogues, vocals)
@@ -828,13 +822,13 @@ def main():
     manifest = generate_clips(dialogues, speaker_refs, ref_cache)
 
     # Step 5b: Post-process with emotion effects
-    postprocess_clips(manifest)
+    dub_common.postprocess_clips(manifest)
 
     # Step 6: Assemble voice track
-    voice_path = assemble_voice_track(manifest, total_duration)
+    voice_path = dub_common.assemble_voice_track(manifest, total_duration, WORKDIR)
 
     # Step 7: Mix with smart ducking
-    mix_audio(voice_path, vocals, bg, manifest, args.output)
+    dub_common.mix_audio(voice_path, vocals, bg, manifest, args.output)
 
     print(f"\n=== DONE! ===")
     print(f"Output: {args.output}")

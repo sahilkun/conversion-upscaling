@@ -483,25 +483,50 @@ def export_download(src, variant, dub_audio=None):
     print(f"  Saved {outpath}")
 
 
-def run_dub_generator(ass_path, duration, src_mkv):
-    """Run dub_generate.py under Python 3.11 (required for XTTS v2 + Demucs)."""
-    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dub_generate.py")
+def run_dub_generator(ass_path, duration, src_mkv, engine="fish"):
+    """Run the dubbing pipeline under Python 3.11.
+
+    Dispatches to the appropriate TTS engine script.
+    Both scripts handle Demucs separation internally via dub_common.
+    """
+    base = os.path.dirname(os.path.abspath(__file__))
+    voices_dir = os.path.join(base, "voices")
+    output = os.path.join(OUT, "dub_work", "english_dub.wav")
+
+    if engine == "fish":
+        script = os.path.join(base, "cloud_dub.py")
+        cmd = [
+            "py", "-3.11", script,
+            "--src", src_mkv,
+            "--subs", ass_path,
+            "--output", output,
+        ]
+    elif engine == "gptsovits":
+        script = os.path.join(base, "gptsovits_dub.py")
+        cmd = [
+            "py", "-3.11", script,
+            "--src", src_mkv,
+            "--subs", ass_path,
+            "--output", output,
+            "--voices-dir", voices_dir,
+        ]
+        labels = "speaker_labels.txt"
+        if os.path.exists(labels):
+            cmd += ["--labels", labels]
+    else:
+        print(f"ERROR: Unknown TTS engine '{engine}'")
+        return False
+
     if not os.path.exists(script):
         print(f"ERROR: {script} not found")
         return False
 
-    cmd = ["py", "-3.11", script, ass_path, str(duration), OUT, src_mkv]
-    voices_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "voices")
-    if os.path.isdir(voices_dir):
-        cmd.append(voices_dir)
-
-    print(f"  Launching dub generator (Python 3.11 + XTTS v2 + Demucs)...")
+    print(f"  Launching {engine} dubbing pipeline (Python 3.11)...")
     try:
         subprocess.run(cmd, check=True)
         return True
     except FileNotFoundError:
-        print("ERROR: Python 3.11 not found. Install it via: https://www.python.org/downloads/")
-        print("       Then install TTS + Demucs: py -3.11 -m pip install TTS demucs")
+        print("ERROR: Python 3.11 not found. Install: https://www.python.org/downloads/")
         return False
     except subprocess.CalledProcessError:
         print("ERROR: Dub generation failed")
@@ -564,6 +589,10 @@ def main():
         choices=["720", "1080", "2160", "subs", "thumbs", "gallery", "upscale", "dub", "download"],
         help="Run only the specified tasks (default: all)"
     )
+    parser.add_argument(
+        "--tts-engine", choices=["fish", "gptsovits"], default="fish",
+        help="TTS engine for dubbing (default: fish)"
+    )
     args = parser.parse_args()
 
     tasks = set(args.only) if args.only else {"720", "1080", "2160", "subs", "thumbs", "gallery"}
@@ -619,7 +648,7 @@ def main():
     # Phase 9: English dub generation via XTTS v2
     has_dub = False
     if "dub" in tasks:
-        has_dub = run_dub_generator("subtitle.ass", info["duration"], src_1080)
+        has_dub = run_dub_generator("subtitle.ass", info["duration"], src_1080, engine=args.tts_engine)
 
     # Auto-detect existing dub from previous run
     if not has_dub and os.path.isdir(os.path.join(OUT, "audio_en")):
