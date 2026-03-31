@@ -51,12 +51,14 @@ def generate_clips(tts, dialogues, speaker_refs):
     print("\n=== Generating English speech (GPT-SoVITS) ===")
     clips_dir = os.path.join(WORKDIR, "clips")
     os.makedirs(clips_dir, exist_ok=True)
+    failures_path = os.path.join(WORKDIR, "failures.txt")
 
     import soundfile as sf
 
     fallback_spk = next(iter(speaker_refs)) if speaker_refs else None
     manifest = []
     emotions = {}
+    failures = []
 
     for i, d in enumerate(dialogues):
         clip_path = os.path.join(clips_dir, f"line_{i:04d}.wav")
@@ -82,6 +84,8 @@ def generate_clips(tts, dialogues, speaker_refs):
             continue
 
         ref_path, ref_text, aux_paths = speaker_refs[spk]
+        word_count = len(d["text"].split())
+        max_expected = max(d["duration"] * 2.5, word_count * 0.8)
 
         try:
             # Pad short text to prevent GPT-SoVITS stutter on single words
@@ -90,7 +94,6 @@ def generate_clips(tts, dialogues, speaker_refs):
                 tts_text = f"Well, {tts_text.lower()}"
 
             # Cap max tokens based on text length to prevent repetition loops
-            # ~10 tokens per word is generous; short texts get fewer tokens
             word_count = len(tts_text.split())
             max_tokens = min(max(word_count * 15, 50), 1024)
 
@@ -117,15 +120,14 @@ def generate_clips(tts, dialogues, speaker_refs):
 
             # Quality check — discard if repetition loop (way too long)
             if os.path.exists(clip_path):
-                import struct as _struct
                 with wave.open(clip_path, "rb") as _wf:
-                    _nframes = _wf.getnframes()
-                    _sr = _wf.getframerate()
-                _clip_dur = _nframes / _sr
-                _max_expected = max(d["duration"] * 2.5, len(tts_text.split()) * 0.8)
-                if _clip_dur > _max_expected:
+                    _clip_dur = _wf.getnframes() / _wf.getframerate()
+                if _clip_dur > max_expected:
+                    safe = d["text"][:40]
+                    print(f"  LOOP detected line {i} ({safe}): {_clip_dur:.1f}s > {max_expected:.1f}s — skipping")
                     os.remove(clip_path)
-                    continue  # Skip this line rather than retry with different voice
+                    failures.append(f"line {i:04d} [{d['start']:.2f}s] LOOP: {d['text'][:60]}")
+                    continue
 
             if os.path.exists(clip_path) and os.path.getsize(clip_path) > 1000:
                 manifest.append({
@@ -133,14 +135,25 @@ def generate_clips(tts, dialogues, speaker_refs):
                     "target_duration": d["duration"],
                     "emotion": emotion, "volume_factor": volume_factor,
                 })
+            else:
+                failures.append(f"line {i:04d} [{d['start']:.2f}s] EMPTY: {d['text'][:60]}")
 
         except Exception as e:
             safe = d["text"][:40]
             print(f"  WARNING: line {i} ({safe}): {e}")
+            failures.append(f"line {i:04d} [{d['start']:.2f}s] ERROR: {d['text'][:60]}")
             continue
 
         if (i + 1) % 25 == 0:
-            print(f"  Progress: {i+1}/{len(dialogues)} | emotions: {emotions}")
+            print(f"  Progress: {i+1}/{len(dialogues)} | emotions: {emotions} | failures: {len(failures)}")
+
+    # Write failures log
+    if failures:
+        with open(failures_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(failures) + "\n")
+        print(f"  FAILED {len(failures)}/{len(dialogues)} lines — see {failures_path}")
+    else:
+        print(f"  All lines generated successfully")
 
     print(f"  Generated {len(manifest)} clips | emotions: {emotions}")
     return manifest

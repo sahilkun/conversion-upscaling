@@ -563,6 +563,18 @@ def assemble_voice_track(manifest, total_duration, workdir, sample_rate=44100):
         wf.writeframes(struct.pack(f"<{len(timeline)}h",
             *[max(-32768, min(32767, int(v * scale))) for v in timeline]))
 
+    # Duration validation
+    try:
+        with wave.open(voice_path, "rb") as _wf:
+            actual_dur = _wf.getnframes() / _wf.getframerate()
+        delta = abs(actual_dur - total_duration)
+        if delta > 2.0:
+            print(f"  WARNING: voice track duration mismatch — expected {total_duration:.1f}s, got {actual_dur:.1f}s (delta {delta:.1f}s)")
+        else:
+            print(f"  Duration check OK: {actual_dur:.1f}s (expected {total_duration:.1f}s)")
+    except Exception as _e:
+        print(f"  WARNING: could not verify voice track duration: {_e}")
+
     print(f"  Voice track: {voice_path} ({total_duration:.1f}s)")
     return voice_path
 

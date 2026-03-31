@@ -512,15 +512,40 @@ def bootstrap_english_refs(dialogues, speaker_refs):
 
 
 # ── Generate Speech via Fish Speech API ─────────────────────────────────────
+def _wav_duration(path):
+    """Return duration of a WAV file in seconds."""
+    try:
+        with wave.open(path, "rb") as wf:
+            return wf.getnframes() / wf.getframerate()
+    except Exception:
+        return 0.0
+
+
+def _tts_request(tagged_text, ref_b64, temperature, repetition_penalty):
+    """Single TTS API call. Returns response or raises."""
+    return requests.post(
+        f"{API_URL}/v1/tts",
+        json={
+            "text": tagged_text, "reference_audio": ref_b64, "format": "wav",
+            "seed": TTS_SEED, "temperature": temperature,
+            "top_p": TTS_TOP_P, "repetition_penalty": repetition_penalty,
+            "use_memory_cache": "on",
+        },
+        timeout=120,
+    )
+
+
 def generate_clips(dialogues, speaker_refs, ref_cache):
     """Generate English TTS clips with emotion tags and consistent voice refs."""
     print("\n=== Step 5: Generating English speech (Fish Speech 1.5) ===")
     clips_dir = os.path.join(WORKDIR, "clips")
     os.makedirs(clips_dir, exist_ok=True)
+    failures_path = os.path.join(WORKDIR, "failures.txt")
 
     fallback_ref_b64 = next(iter(ref_cache.values())) if ref_cache else None
     manifest = []
     emotions = {}
+    failures = []
 
     for i, d in enumerate(dialogues):
         clip_path = os.path.join(clips_dir, f"line_{i:04d}.wav")
@@ -553,41 +578,72 @@ def generate_clips(dialogues, speaker_refs, ref_cache):
 
         # Add emotion tag to text
         tagged_text = add_emotion_tags(d["text"], emotion)
+        # Max expected duration: 2.5x subtitle duration or generous word-time estimate
+        word_count = len(d["text"].split())
+        max_expected = max(d["duration"] * 2.5, word_count * 0.8)
 
-        try:
-            resp = requests.post(
-                f"{API_URL}/v1/tts",
-                json={
-                    "text": tagged_text, "reference_audio": ref_b64, "format": "wav",
-                    "seed": TTS_SEED, "temperature": TTS_TEMPERATURE,
-                    "top_p": TTS_TOP_P, "repetition_penalty": TTS_REPETITION_PENALTY,
-                    "use_memory_cache": "on",
-                },
-                timeout=120,
-            )
+        # Retry schedule: (temperature, repetition_penalty)
+        retry_schedule = [
+            (TTS_TEMPERATURE,       TTS_REPETITION_PENALTY),
+            (TTS_TEMPERATURE + 0.1, TTS_REPETITION_PENALTY + 0.3),  # retry 1: more diverse + stricter penalty
+            (TTS_TEMPERATURE - 0.1, TTS_REPETITION_PENALTY + 0.5),  # retry 2: more focused + even stricter
+        ]
 
-            if resp.status_code == 200 and len(resp.content) > 1000:
-                with open(clip_path, "wb") as f:
-                    f.write(resp.content)
-                manifest.append({
-                    "path": clip_path,
-                    "start": d["start"],
-                    "target_duration": d["duration"],
-                    "emotion": emotion,
-                    "speed_factor": speed_factor,
-                    "volume_factor": volume_factor,
-                })
-            else:
+        success = False
+        for attempt, (temp, rep_pen) in enumerate(retry_schedule):
+            import time
+            if attempt > 0:
+                time.sleep(attempt)  # 1s, 2s backoff
+                if os.path.exists(clip_path):
+                    os.remove(clip_path)
+
+            try:
+                resp = _tts_request(tagged_text, ref_b64, temp, rep_pen)
+
+                if resp.status_code == 200 and len(resp.content) > 1000:
+                    with open(clip_path, "wb") as f:
+                        f.write(resp.content)
+
+                    # Repetition loop detection
+                    clip_dur = _wav_duration(clip_path)
+                    if clip_dur > max_expected:
+                        safe = d["text"][:40]
+                        print(f"  LOOP detected line {i} ({safe}): {clip_dur:.1f}s > {max_expected:.1f}s limit, attempt {attempt+1}")
+                        os.remove(clip_path)
+                        continue  # try next retry params
+
+                    success = True
+                    manifest.append({
+                        "path": clip_path,
+                        "start": d["start"],
+                        "target_duration": d["duration"],
+                        "emotion": emotion,
+                        "speed_factor": speed_factor,
+                        "volume_factor": volume_factor,
+                    })
+                    break
+                else:
+                    safe = d["text"][:40]
+                    print(f"  WARNING: line {i} ({safe}): status={resp.status_code} size={len(resp.content)} (attempt {attempt+1})")
+
+            except Exception as e:
                 safe = d["text"][:40]
-                print(f"  WARNING: line {i} ({safe}): status={resp.status_code} size={len(resp.content)}")
+                print(f"  WARNING: Failed line {i} ({safe}): {e} (attempt {attempt+1})")
 
-        except Exception as e:
-            safe = d["text"][:40]
-            print(f"  WARNING: Failed line {i} ({safe}): {e}")
-            continue
+        if not success:
+            safe = d["text"][:60]
+            failures.append(f"line {i:04d} [{d['start']:.2f}s]: {safe}")
 
         if (i + 1) % 25 == 0:
-            print(f"  Progress: {i+1}/{len(dialogues)} | emotions: {emotions}")
+            print(f"  Progress: {i+1}/{len(dialogues)} | emotions: {emotions} | failures: {len(failures)}")
+
+    # Write failures log
+    if failures:
+        with open(failures_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(failures) + "\n")
+        print(f"  FAILED {len(failures)}/{len(dialogues)} lines — see {failures_path}")
+    else:
+        print(f"  All lines generated successfully")
 
     print(f"  Generated {len(manifest)} clips | emotions: {emotions}")
     return manifest
