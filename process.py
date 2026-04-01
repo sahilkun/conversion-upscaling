@@ -486,8 +486,20 @@ def export_download(src, variant, dub_audio=None):
 def run_dub_generator(ass_path, duration, src_mkv, engine="fish"):
     """Run the dubbing pipeline under Python 3.11.
 
-    Dispatches to the appropriate TTS engine script.
-    Both scripts handle Demucs separation internally via dub_common.
+    Primary engine: Fish Speech 1.5 (default, recommended)
+      - Zero-shot voice cloning from extracted calm reference
+      - Temperature 0.15 + per-speaker seed → consistent voice across all lines
+      - Better English prosody and emotion than GPT-SoVITS zero-shot
+      - Start Fish Speech API first:
+          cd fish-speech-v15 && py -3.11 tools/api_server.py
+          --llama-checkpoint-path ../models/fish-speech-1.5
+          --decoder-checkpoint-path ../models/fish-speech-1.5/firefly-gan-vq-fsq-8x1024-21hz-generator.pth
+          --half --listen 127.0.0.1:8080
+
+    Alternative: GPT-SoVITS (only use when you have a fine-tuned model for the character)
+      - Zero-shot quality is inferior to Fish Speech
+      - Worth switching to ONLY when training data exists in GPT-SoVITS/experiments/
+      - Use: --tts-engine gptsovits
     """
     base = os.path.dirname(os.path.abspath(__file__))
     voices_dir = os.path.join(base, "voices")
@@ -591,7 +603,8 @@ def main():
     )
     parser.add_argument(
         "--tts-engine", choices=["fish", "gptsovits"], default="fish",
-        help="TTS engine for dubbing (default: fish)"
+        help="TTS engine for dubbing. fish (default): recommended, zero-shot, consistent voice. "
+             "gptsovits: only use when you have a fine-tuned model in GPT-SoVITS/experiments/"
     )
     args = parser.parse_args()
 
