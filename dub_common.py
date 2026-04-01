@@ -242,11 +242,10 @@ def assign_speakers(dialogues, labels_path=None, speaker_map=None):
     if labels_path and os.path.isfile(labels_path):
         print(f"  Using manual speaker labels: {labels_path}")
         labels = load_speaker_labels(labels_path)
-        labeled_indices = sorted(labels.keys())
-        for i, label_idx in enumerate(labeled_indices):
-            if i < len(dialogues):
-                dialogues[i]["speaker"] = labels[label_idx]
-                dialogues[i]["gender"] = labels[label_idx]
+        for label_idx, speaker in labels.items():
+            if label_idx < len(dialogues):
+                dialogues[label_idx]["speaker"] = speaker
+                dialogues[label_idx]["gender"] = speaker
         for d in dialogues:
             if "speaker" not in d:
                 d["speaker"] = "female"
@@ -448,8 +447,10 @@ def _voice_fingerprint(wav_path, max_samples=44100):
         fast_energy = sum(abs(frame_rms[j] - frame_rms[j+1])
                           for j in range(len(frame_rms) - 1))
 
-        low_ratio = slow_energy / (total_energy * len(frame_rms))
-        high_ratio = fast_energy / (total_energy * len(frame_rms))
+        # Normalize by total_energy only — dividing by len() too would make
+        # ratios near-zero for long clips, breaking cross-clip comparison
+        low_ratio = slow_energy / total_energy
+        high_ratio = fast_energy / total_energy
 
         return (zcr, low_ratio, high_ratio)
 
@@ -493,7 +494,8 @@ def _snr_ok(wav_path, min_snr_db=10.0):
 
         samples = struct.unpack(f"<{len(raw)//2}h", raw)
         if n_channels == 2:
-            samples = [abs(samples[j] + samples[j+1]) // 2 for j in range(0, len(samples), 2)]
+            # Average channels first, then take abs — don't rectify before averaging
+            samples = [abs((samples[j] + samples[j+1]) // 2) for j in range(0, len(samples), 2)]
         else:
             samples = [abs(s) for s in samples]
 
@@ -667,10 +669,11 @@ def extract_calm_refs(dialogues, vocals_path, workdir,
     return speaker_refs
 
 
-def resolve_voice_refs(extracted_refs, voices_dir, training_dir=None):
+def resolve_voice_refs(extracted_refs, voices_dir, training_dir=None, speaker_genders=None):
     """Resolve final voice references per speaker with fallback chain.
 
     Priority: 1) Extracted calm refs, 2) Series training_data/, 3) Default voices.
+    speaker_genders: optional dict {speaker_name: "male"/"female"} from assign_speakers().
     Returns {speaker: (wav_path, prompt_text, aux_paths)}.
     """
     result = {}
@@ -683,6 +686,23 @@ def resolve_voice_refs(extracted_refs, voices_dir, training_dir=None):
     # Ensure at least female and male exist
     speakers.update(["female", "male"])
 
+    def _gender_for(spk):
+        """Determine gender for a speaker name.
+
+        Priority: explicit map > name contains 'male'/'female' > default female.
+        Named characters (Sachi, Aoi, etc.) default to female since most anime
+        protagonists are female; wrong gender is better than wrong voice fallback.
+        """
+        if speaker_genders and spk in speaker_genders:
+            return speaker_genders[spk]
+        if spk in ("female", "male"):
+            return spk
+        if "female" in spk:
+            return "female"
+        if "male" in spk:
+            return "male"
+        return "female"  # safe default for named characters
+
     for spk in speakers:
         wav_path = None
         prompt_text = ""
@@ -693,7 +713,7 @@ def resolve_voice_refs(extracted_refs, voices_dir, training_dir=None):
 
         # Priority 2: Training data (series-specific)
         if not wav_path and training_dir:
-            gender = "female" if "female" in spk else "male"
+            gender = _gender_for(spk)
             train_dir = os.path.join(training_dir, gender)
             if os.path.isdir(train_dir):
                 wavs = sorted([f for f in os.listdir(train_dir) if f.endswith(".wav")])
@@ -702,7 +722,7 @@ def resolve_voice_refs(extracted_refs, voices_dir, training_dir=None):
 
         # Priority 3: Default voice
         if not wav_path:
-            gender = "female" if "female" in spk else "male"
+            gender = _gender_for(spk)
             default = defaults.get(gender)
             if default and os.path.exists(default):
                 wav_path = default
@@ -1189,49 +1209,40 @@ def assemble_voice_track(manifest, total_duration, workdir, sample_rate=44100):
 
 # ── Audio Mixing ──────────────────────────────────────────────────────────────
 
-def _build_duck_filter(duck_points, vol_normal=0.7, vol_duck=0.08, fade=0.05):
-    """Build an FFmpeg volume expression with smooth 50ms fade in/out ramps.
-
-    Each segment uses a trapezoid envelope:
-      rise over [s-fade, s], hold over [s, e], fall over [e, e+fade].
-    Expressed as: max(0,min(1,(t-s)/fade+1)) * max(0,min(1,(e-t)/fade+1))
-    All segments summed and clamped to [0,1] to handle adjacent lines.
-    Final volume: vol_normal - (vol_normal - vol_duck) * duck_factor
-    """
-    if not duck_points:
-        return f"volume={vol_normal}"
-
-    F = fade
-    seg_exprs = [
-        f"max(0,min(1,(t-{s:.3f})/{F}+1))*max(0,min(1,({e:.3f}-t)/{F}+1))"
-        for s, e in duck_points
-    ]
-    sum_expr = "+".join(seg_exprs)
-    duck_range = vol_normal - vol_duck  # 0.62
-    return f"volume='{vol_normal}-{duck_range:.4f}*min(1,{sum_expr})':eval=frame"
-
-
 def mix_audio(voice_path, vocals_path, bg_path, manifest, output_path):
     """Mix English voice + ducked Japanese vocals + background.
 
-    Smart ducking: JP vocals muted during English speech, audible between.
-    Smooth 50ms fade in/out ramps on duck transitions.
+    Smart ducking via sidechaincompress: the English voice track is used as the
+    sidechain key — JP vocals are automatically ducked whenever English speech
+    is present. This replaces the O(N) expression string that exceeded FFmpeg's
+    parser limit for 300+ line episodes.
+    Attack 5ms / release 200ms gives punch-in/out without pumping.
     Voice gets pseudo-stereo widening (haas effect) to avoid flat mono sound.
     Background music always present at moderate level.
     """
     print("\n=== Mixing final audio ===")
 
-    duck_points = [(m["start"], m["start"] + m["target_duration"]) for m in manifest]
-    vocal_filter = _build_duck_filter(duck_points)
-
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-    # Pseudo-stereo (haas): original on left, 20ms delayed copy on right
-    # Creates natural space without changing timbre
-    voice_stereo = (
-        "[0]asplit[vl][vr];"
+    # [0] = English voice (mono), [1] = JP vocals, [2] = background
+    #
+    # 1. Split voice: one copy for haas chain, one as sidechain key for ducking
+    # 2. Haas pseudo-stereo on voice (original L, 20ms delayed R)
+    # 3. Sidechain-compress JP vocals: duck when English voice has signal
+    #    threshold=0.02 (~-34dBFS) triggers on voice, ratio=10 gives ~10x attenuation
+    # 4. Final mix + dynamics + loudnorm
+    filter_complex = (
+        "[0]asplit=2[en_raw][en_sc];"
+        "[en_raw]asplit[vl][vr];"
         "[vr]adelay=20[vrd];"
-        "[vl][vrd]amerge,volume=2.0[en]"
+        "[vl][vrd]amerge,volume=2.0[en];"
+        "[1][en_sc]sidechaincompress="
+        "threshold=0.02:ratio=10:attack=5:release=200:makeup=1[ja_sc];"
+        "[ja_sc]volume=0.7[ja];"
+        "[2]volume=0.8[bg];"
+        "[en][ja][bg]amix=inputs=3:duration=longest:normalize=0,"
+        "compand=attacks=0.05:decays=0.3:points=-80/-80|-30/-15|-10/-8|0/-6:soft-knee=6:gain=4,"
+        "loudnorm=I=-16:TP=-1.5:LRA=7[out]"
     )
 
     subprocess.run([
@@ -1239,13 +1250,7 @@ def mix_audio(voice_path, vocals_path, bg_path, manifest, output_path):
         "-i", voice_path,
         "-i", vocals_path,
         "-i", bg_path,
-        "-filter_complex",
-        f"{voice_stereo};"
-        f"[1]{vocal_filter}[ja];"
-        f"[2]volume=0.8[bg];"
-        f"[en][ja][bg]amix=inputs=3:duration=longest:normalize=0,"
-        f"compand=attacks=0.05:decays=0.3:points=-80/-80|-30/-15|-10/-8|0/-6:soft-knee=6:gain=4,"
-        f"loudnorm=I=-16:TP=-1.5:LRA=7[out]",
+        "-filter_complex", filter_complex,
         "-map", "[out]",
         "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
         output_path

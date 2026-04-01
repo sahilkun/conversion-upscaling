@@ -414,7 +414,7 @@ def bootstrap_english_refs(dialogues, speaker_refs):
         boot_text = None
         for d in dialogues:
             if d["speaker"] == spk and d["duration"] >= 2.0:
-                emo, _, _ = classify_emotion(d["text"])
+                emo, _, _ = dub_common.classify_emotion(d["text"])
                 if emo == "neutral":
                     boot_text = d["text"]
                     break
@@ -435,7 +435,7 @@ def bootstrap_english_refs(dialogues, speaker_refs):
         boot_lines = []
         for d in dialogues:
             if d["speaker"] == spk and d["duration"] >= 2.0:
-                emo, _, _ = classify_emotion(d["text"])
+                emo, _, _ = dub_common.classify_emotion(d["text"])
                 if emo == "neutral":
                     boot_lines.append(d["text"])
                     if len(boot_lines) >= 3:

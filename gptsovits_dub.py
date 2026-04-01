@@ -84,14 +84,16 @@ def generate_clips(tts, dialogues, speaker_refs):
                 with wave.open(clip_path, "rb") as _wf:
                     if _wf.getnframes() == 0:
                         raise ValueError("empty WAV")
+                # Only append if WAV is verified intact
+                manifest.append({
+                    "path": clip_path, "start": d["start"],
+                    "target_duration": d["duration"],
+                    "emotion": emotion, "volume_factor": volume_factor,
+                })
+                continue
             except Exception:
-                os.remove(clip_path)  # corrupted — regenerate
-            manifest.append({
-                "path": clip_path, "start": d["start"],
-                "target_duration": d["duration"],
-                "emotion": emotion, "volume_factor": volume_factor,
-            })
-            continue
+                if os.path.exists(clip_path):
+                    os.remove(clip_path)  # corrupted — fall through to regenerate
 
         if d["duration"] < 0.3:
             continue
@@ -271,8 +273,15 @@ def main():
     )
     # Convert extracted {speaker: wav_path} to full ref format
     extracted_full = {spk: (path, "", []) for spk, path in extracted.items()}
+    # Build gender map from dialogues for named character fallback
+    speaker_genders = {}
+    for d in dialogues:
+        spk = d.get("speaker", "")
+        if spk and spk not in speaker_genders:
+            speaker_genders[spk] = d.get("gender", "female")
     speaker_refs = dub_common.resolve_voice_refs(
-        extracted_full, voices_dir, training_dir=training_dir
+        extracted_full, voices_dir, training_dir=training_dir,
+        speaker_genders=speaker_genders
     )
 
     # Step 5: Load GPT-SoVITS
