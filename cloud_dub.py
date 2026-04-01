@@ -405,10 +405,14 @@ def bootstrap_english_refs(dialogues, speaker_refs):
                         for tp in tmp_paths:
                             os.remove(tp)
 
-                with open(en_ref_path, "rb") as f:
-                    cache[spk] = base64.b64encode(f.read()).decode()
-                size_kb = os.path.getsize(en_ref_path) / 1024
-                print(f"    -> English ref created ({len(en_clips)} clips, {size_kb:.0f} KB)")
+                if os.path.exists(en_ref_path) and os.path.getsize(en_ref_path) > 500:
+                    with open(en_ref_path, "rb") as f:
+                        cache[spk] = base64.b64encode(f.read()).decode()
+                    size_kb = os.path.getsize(en_ref_path) / 1024
+                    print(f"    -> English ref created ({len(en_clips)} clips, {size_kb:.0f} KB)")
+                else:
+                    cache[spk] = jp_b64
+                    print(f"    -> All bootstrap clips invalid, using Japanese ref")
             else:
                 # Fallback to Japanese ref
                 cache[spk] = jp_b64

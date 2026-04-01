@@ -186,7 +186,8 @@ def generate_clips(tts, dialogues, speaker_refs):
                 manifest.append({
                     "path": clip_path, "start": d["start"],
                     "target_duration": d["duration"],
-                    "emotion": emotion, "volume_factor": volume_factor,
+                    "emotion": emotion, "speed_factor": speed_factor,
+                    "volume_factor": volume_factor,
                 })
             else:
                 failures.append(f"line {i:04d} [{d['start']:.2f}s] EMPTY: {d['text'][:60]}")

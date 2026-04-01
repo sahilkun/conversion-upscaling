@@ -27,7 +27,7 @@ def _safe_filename(name):
     Removes chars illegal on Windows (<>:"/\\|?* and control chars),
     strips trailing spaces/dots, and truncates to 64 chars.
     """
-    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
+    safe = re.sub(r'[<>:"/\\|?*;\x00-\x1f]', '_', name)
     safe = safe.rstrip(' .')
     return (safe[:64] or "speaker")
 
@@ -571,7 +571,9 @@ def _snr_ok(wav_path, min_snr_db=10.0):
         signal = sum(frame_rms[-(len(frame_rms) // 4):]) / (len(frame_rms) // 4)
 
         if noise_floor < 1:
-            return True  # near-silence, can't compute SNR meaningfully
+            # Near-silence: clip is too quiet to be useful as a voice reference.
+            # Reject rather than accept (a silent ref produces a silent TTS output).
+            return False
 
         import math
         snr = 20 * math.log10(signal / noise_floor)
@@ -725,7 +727,10 @@ def extract_calm_refs(dialogues, vocals_path, workdir,
         if "_cand" in f:
             fp = os.path.join(refs_dir, f)
             if os.path.abspath(fp) not in refs_to_keep:
-                os.remove(fp)
+                try:
+                    os.remove(fp)
+                except OSError:
+                    pass  # already deleted by SNR rejection in the loop above
     silence = os.path.join(refs_dir, "silence_0.3s.wav")
     if os.path.exists(silence):
         os.remove(silence)
@@ -1001,9 +1006,11 @@ def postprocess_clips(manifest):
                         new_dur = probe_duration(clip_path)
                         if new_dur and new_dur > 0:
                             m["target_duration"] = new_dur
-            except Exception:
+            except Exception as _pp_err:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
+                print(f"  WARNING: postprocess failed for {os.path.basename(clip_path)}"
+                      f" ({emotion}): {_pp_err}")
 
     print(f"  Post-processed {processed} clips")
     return processed
@@ -1117,6 +1124,7 @@ def time_stretch_clips(manifest):
 
     print(f"\n=== Time-stretching long clips (engine: {'rubberband' if _RUBBERBAND else 'atempo'}) ===")
     stretched = 0
+    stretch_failures = 0
     methods = {}
 
     for m in manifest:
@@ -1143,12 +1151,20 @@ def time_stretch_clips(manifest):
                 if os.path.exists(tmp) and os.path.getsize(tmp) > 500:
                     os.replace(tmp, clip)
                     stretched += 1
-            except Exception:
+                else:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                    stretch_failures += 1
+                    print(f"  WARNING: stretch produced empty output for {os.path.basename(clip)}")
+            except Exception as _se:
                 if os.path.exists(tmp):
                     os.remove(tmp)
+                stretch_failures += 1
+                print(f"  WARNING: stretch failed for {os.path.basename(clip)}: {_se}")
 
     method_summary = ", ".join(f"{m}:{n}" for m, n in methods.items()) if methods else "none"
-    print(f"  Stretched {stretched} clips ({method_summary})")
+    fail_note = f", {stretch_failures} failed" if stretch_failures else ""
+    print(f"  Stretched {stretched} clips ({method_summary}{fail_note})")
     return stretched
 
 
@@ -1190,10 +1206,28 @@ def resolve_overlaps(manifest):
                 continue
 
             if overlap < 0.2:
-                # Trim: shorten current clip's target duration
-                manifest[i]["target_duration"] = nxt["start"] - cur["start"]
-                resolved += 1
-                changes_this_pass += 1
+                # Trim: truncate the on-disk clip so it doesn't bleed into the
+                # next subtitle's region in the amix timeline.
+                new_target = nxt["start"] - cur["start"]
+                clip = cur["path"]
+                tmp = clip + ".trim.wav"
+                try:
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", clip,
+                         "-af", f"atrim=end={new_target:.4f},asetpts=PTS-STARTPTS",
+                         tmp],
+                        check=True, capture_output=True
+                    )
+                    if os.path.exists(tmp) and os.path.getsize(tmp) > 500:
+                        os.replace(tmp, clip)
+                        manifest[i]["target_duration"] = new_target
+                        resolved += 1
+                        changes_this_pass += 1
+                    elif os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
 
             elif overlap < 0.5:
                 # Speed up: re-stretch current clip to fit exactly before next.
@@ -1217,8 +1251,10 @@ def resolve_overlaps(manifest):
                             manifest[i]["target_duration"] = new_target
                             resolved += 1
                             changes_this_pass += 1
-                    except Exception:
-                        pass
+                    except Exception as _oe:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                        print(f"  WARNING: overlap stretch failed for line {i}: {_oe}")
             elif i not in warned_set:
                 print(f"  OVERLAP WARNING: line {i} overlaps next by {overlap*1000:.0f}ms — leaving as-is")
                 warned_set.add(i)
@@ -1351,7 +1387,7 @@ def mix_audio(voice_path, vocals_path, bg_path, manifest, output_path):
         "[en_raw]asplit[vl][vr];"
         "[vr]adelay=20ms[vrd];"
         "[vl][vrd]amerge[en];"
-        "[en_sc]aformat=channel_layouts=stereo[en_sc_st];"
+        "[en_sc]pan=stereo|c0=c0|c1=c0[en_sc_st];"
         "[1][en_sc_st]sidechaincompress="
         "threshold=0.02:ratio=10:attack=5:release=200:makeup=1[ja_sc];"
         "[ja_sc]volume=0.7[ja];"
