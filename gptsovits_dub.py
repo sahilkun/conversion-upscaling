@@ -46,6 +46,14 @@ import dub_common
 
 
 # ── Generate All Clips ─────────────────────────────────────────────────────
+def _gptsovits_speaker_seed(speaker, base=42):
+    """Deterministic per-speaker seed — same character always uses same seed."""
+    h = 0
+    for ch in speaker:
+        h = (h * 31 + ord(ch)) & 0xFFFFFF
+    return base ^ h
+
+
 def generate_clips(tts, dialogues, speaker_refs):
     """Generate all TTS clips using GPT-SoVITS."""
     print("\n=== Generating English speech (GPT-SoVITS) ===")
@@ -59,6 +67,8 @@ def generate_clips(tts, dialogues, speaker_refs):
     manifest = []
     emotions = {}
     failures = []
+    speaker_fingerprints = {}
+    speaker_baseline = {}
 
     for i, d in enumerate(dialogues):
         clip_path = os.path.join(clips_dir, f"line_{i:04d}.wav")
@@ -112,6 +122,7 @@ def generate_clips(tts, dialogues, speaker_refs):
             word_count = len(tts_text.split())
             max_tokens = min(max(word_count * 15, 50), 1024)
 
+            spk_seed = _gptsovits_speaker_seed(d["speaker"])
             inputs = {
                 "text": tts_text,
                 "text_lang": "en",
@@ -121,14 +132,14 @@ def generate_clips(tts, dialogues, speaker_refs):
                 "prompt_lang": "en",
                 "top_k": 15,
                 "top_p": 0.8,
-                "temperature": 0.6,
-                "seed": 42,
+                "temperature": 0.4,   # was 0.6 — lower = more consistent voice
+                "seed": spk_seed,     # per-speaker deterministic seed
                 "repetition_penalty": 2.0,
                 "max_new_tokens": max_tokens,
                 "speed_factor": speed_factor,
             }
 
-            # Generate clip — same seed always for voice consistency
+            # Generate clip — per-speaker seed for voice consistency
             for sr, audio in tts.run(inputs):
                 sf.write(clip_path, audio, sr)
                 break
@@ -145,6 +156,21 @@ def generate_clips(tts, dialogues, speaker_refs):
                     continue
 
             if os.path.exists(clip_path) and os.path.getsize(clip_path) > 1000:
+                # Voice consistency fingerprint check
+                fp = dub_common._voice_fingerprint(clip_path)
+                if fp is not None:
+                    baseline = speaker_baseline.get(d["speaker"])
+                    if baseline and not dub_common.fingerprints_consistent(baseline, fp):
+                        print(f"  VOICE DRIFT line {i}: fingerprint mismatch, accepting anyway (GPT-SoVITS no retry)")
+                    fps = speaker_fingerprints.setdefault(d["speaker"], [])
+                    fps.append(fp)
+                    if len(fps) >= 3:
+                        n = len(fps)
+                        speaker_baseline[d["speaker"]] = tuple(
+                            sum(f[c] for f in fps) / n for c in range(len(fps[0]))
+                        )
+                    if len(fps) > 10:
+                        fps.pop(0)
                 manifest.append({
                     "path": clip_path, "start": d["start"],
                     "target_duration": d["duration"],

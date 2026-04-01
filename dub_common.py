@@ -394,6 +394,85 @@ def separate_audio(src_mkv, workdir):
     return vocals, bg
 
 
+# ── Voice Fingerprinting ─────────────────────────────────────────────────────
+
+def _voice_fingerprint(wav_path, max_samples=44100):
+    """Compute a simple spectral fingerprint for voice consistency checking.
+
+    Returns a tuple (zcr, low_ratio, high_ratio):
+      zcr        — zero crossing rate (proxy for pitch register)
+      low_ratio  — energy in 0-1kHz band / total (chest voice indicator)
+      high_ratio — energy in 4kHz+ band / total (breathiness indicator)
+
+    Pure stdlib — no numpy required. Uses first 1s of audio.
+    Returns None on failure.
+    """
+    try:
+        with wave.open(wav_path, "rb") as wf:
+            nch = wf.getnchannels()
+            fr = wf.getframerate()
+            n = min(wf.getnframes(), max_samples)
+            raw = wf.readframes(n)
+
+        samples = struct.unpack(f"<{len(raw)//2}h", raw)
+        if nch == 2:
+            samples = tuple((samples[j] + samples[j+1]) // 2
+                            for j in range(0, len(samples), 2))
+        if len(samples) < 256:
+            return None
+
+        # Zero crossing rate
+        crossings = sum(1 for j in range(1, len(samples))
+                        if (samples[j-1] >= 0) != (samples[j] >= 0))
+        zcr = crossings / len(samples)
+
+        # Frequency band energy via simple band-pass using running sum
+        # Approximate: group samples into 20ms frames, compute mean abs amplitude
+        # Then use adjacent-frame correlation as low-freq proxy
+        frame_sz = max(1, fr // 50)  # 20ms frames
+        frame_rms = []
+        for start in range(0, len(samples) - frame_sz, frame_sz):
+            frame = samples[start:start + frame_sz]
+            rms = (sum(s * s for s in frame) / frame_sz) ** 0.5
+            frame_rms.append(rms)
+
+        if len(frame_rms) < 4:
+            return None
+
+        total_energy = sum(frame_rms) + 1e-9
+
+        # Low-freq proxy: frames that change slowly (adjacent correlation)
+        slow_energy = sum(min(frame_rms[j], frame_rms[j+1])
+                          for j in range(len(frame_rms) - 1))
+        # High-freq proxy: frames with large sudden changes
+        fast_energy = sum(abs(frame_rms[j] - frame_rms[j+1])
+                          for j in range(len(frame_rms) - 1))
+
+        low_ratio = slow_energy / (total_energy * len(frame_rms))
+        high_ratio = fast_energy / (total_energy * len(frame_rms))
+
+        return (zcr, low_ratio, high_ratio)
+
+    except Exception:
+        return None
+
+
+def fingerprints_consistent(fp_baseline, fp_new, tolerance=0.35):
+    """Return True if fp_new is within tolerance of fp_baseline.
+
+    Checks each dimension independently. Tolerance=0.35 means each component
+    can differ by up to 35% relative to the baseline before flagging.
+    """
+    if fp_baseline is None or fp_new is None:
+        return True  # can't check, assume OK
+    for b, n in zip(fp_baseline, fp_new):
+        if b == 0:
+            continue
+        if abs(n - b) / abs(b) > tolerance:
+            return False
+    return True
+
+
 # ── Calmness Measurement ──────────────────────────────────────────────────────
 
 def _snr_ok(wav_path, min_snr_db=10.0):

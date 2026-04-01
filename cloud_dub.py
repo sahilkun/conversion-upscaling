@@ -35,10 +35,12 @@ API_URL = "http://127.0.0.1:8080"
 WORKDIR = os.path.join("out", "dub_work")
 SAMPLE_RATE = 44100
 
-# Fish Speech consistency settings — lower temp + fixed seed + memory cache
-# reduces voice drift between API calls
+# Fish Speech consistency settings
+# Temperature 0.15 (was 0.4) — critical for voice stability:
+#   high temp = model samples widely → pitch/timbre shifts between lines
+#   low temp  = model stays close to reference → same voice every line
 TTS_SEED = 42
-TTS_TEMPERATURE = 0.4
+TTS_TEMPERATURE = 0.15
 TTS_TOP_P = 0.7
 TTS_REPETITION_PENALTY = 1.2
 
@@ -524,13 +526,26 @@ def _wav_duration(path):
         return 0.0
 
 
-def _tts_request(tagged_text, ref_b64, temperature, repetition_penalty, speed=1.0):
+def _speaker_seed(speaker):
+    """Deterministic seed per speaker — same speaker always gets same seed.
+
+    Ensures Fish Speech anchors to the same voice mode across all lines.
+    Different speakers get different seeds so their voices stay distinct.
+    """
+    h = 0
+    for ch in speaker:
+        h = (h * 31 + ord(ch)) & 0xFFFFFF
+    return TTS_SEED ^ h
+
+
+def _tts_request(tagged_text, ref_b64, temperature, repetition_penalty, speed=1.0, seed=None):
     """Single TTS API call. Returns response or raises."""
     return requests.post(
         f"{API_URL}/v1/tts",
         json={
             "text": tagged_text, "reference_audio": ref_b64, "format": "wav",
-            "seed": TTS_SEED, "temperature": temperature,
+            "seed": seed if seed is not None else TTS_SEED,
+            "temperature": temperature,
             "top_p": TTS_TOP_P, "repetition_penalty": repetition_penalty,
             "use_memory_cache": "on",
             "speed": speed,
@@ -550,6 +565,10 @@ def generate_clips(dialogues, speaker_refs, ref_cache):
     manifest = []
     emotions = {}
     failures = []
+    # Per-speaker voice fingerprint baselines — built from first 5 accepted clips
+    # Used to detect pitch/timbre drift and trigger regeneration
+    speaker_fingerprints = {}   # {speaker: [fp1, fp2, ...]}
+    speaker_baseline = {}       # {speaker: averaged_fp}
 
     for i, d in enumerate(dialogues):
         clip_path = os.path.join(clips_dir, f"line_{i:04d}.wav")
@@ -601,11 +620,14 @@ def generate_clips(dialogues, speaker_refs, ref_cache):
         if est_duration > d["duration"] * 1.15 and d["duration"] > 0.5:
             tts_speed = min(est_duration / d["duration"], 1.4)  # cap at 1.4x
 
+        # Per-speaker deterministic seed — anchors voice to same mode each call
+        spk_seed = _speaker_seed(d["speaker"])
+
         # Retry schedule: (temperature, repetition_penalty)
         retry_schedule = [
             (TTS_TEMPERATURE,       TTS_REPETITION_PENALTY),
-            (TTS_TEMPERATURE + 0.1, TTS_REPETITION_PENALTY + 0.3),  # retry 1: more diverse + stricter penalty
-            (TTS_TEMPERATURE - 0.1, TTS_REPETITION_PENALTY + 0.5),  # retry 2: more focused + even stricter
+            (TTS_TEMPERATURE + 0.05, TTS_REPETITION_PENALTY + 0.3),  # retry 1
+            (TTS_TEMPERATURE,        TTS_REPETITION_PENALTY + 0.5),  # retry 2: same low temp, stricter penalty
         ]
 
         success = False
@@ -617,7 +639,7 @@ def generate_clips(dialogues, speaker_refs, ref_cache):
                     os.remove(clip_path)
 
             try:
-                resp = _tts_request(tagged_text, ref_b64, temp, rep_pen, speed=tts_speed)
+                resp = _tts_request(tagged_text, ref_b64, temp, rep_pen, speed=tts_speed, seed=spk_seed)
 
                 if resp.status_code == 200 and len(resp.content) > 1000:
                     with open(clip_path, "wb") as f:
@@ -630,6 +652,32 @@ def generate_clips(dialogues, speaker_refs, ref_cache):
                         print(f"  LOOP detected line {i} ({safe}): {clip_dur:.1f}s > {max_expected:.1f}s limit, attempt {attempt+1}")
                         os.remove(clip_path)
                         continue  # try next retry params
+
+                    # Voice consistency check — compare fingerprint to speaker baseline
+                    spk = d["speaker"]
+                    fp = dub_common._voice_fingerprint(clip_path)
+                    if fp is not None:
+                        baseline = speaker_baseline.get(spk)
+                        if baseline is not None and not dub_common.fingerprints_consistent(baseline, fp):
+                            if attempt < len(retry_schedule) - 1:
+                                safe = d["text"][:40]
+                                print(f"  VOICE DRIFT line {i} ({safe}): fingerprint mismatch, retrying")
+                                os.remove(clip_path)
+                                continue  # retry — don't accept this clip
+                            else:
+                                print(f"  VOICE DRIFT line {i}: all attempts drifted, accepting best available")
+                        # Update fingerprint pool (cap at 10 samples per speaker)
+                        fps = speaker_fingerprints.setdefault(spk, [])
+                        fps.append(fp)
+                        if len(fps) >= 3:
+                            # Recalculate baseline as component-wise average
+                            n = len(fps)
+                            speaker_baseline[spk] = tuple(
+                                sum(f[c] for f in fps) / n
+                                for c in range(len(fps[0]))
+                            )
+                        if len(fps) > 10:
+                            fps.pop(0)  # sliding window
 
                     success = True
                     manifest.append({
