@@ -493,10 +493,14 @@ def _voice_fingerprint(wav_path, max_samples=44100):
         fast_energy = sum(abs(frame_rms[j] - frame_rms[j+1])
                           for j in range(len(frame_rms) - 1))
 
-        # Normalize by total_energy only — dividing by len() too would make
-        # ratios near-zero for long clips, breaking cross-clip comparison
-        low_ratio = slow_energy / total_energy
-        high_ratio = fast_energy / total_energy
+        # Normalize relative to per-frame energy to keep ratios comparable
+        # across clips of different lengths. Use N-1 denominator (matching the
+        # pair count) so a flat signal doesn't trivially saturate at ~1.0.
+        n_pairs = len(frame_rms) - 1
+        per_frame_energy = total_energy / len(frame_rms)
+        pair_denom = per_frame_energy * n_pairs + 1e-9
+        low_ratio = slow_energy / pair_denom
+        high_ratio = fast_energy / pair_denom
 
         return (zcr, low_ratio, high_ratio)
 
@@ -983,6 +987,13 @@ def postprocess_clips(manifest):
                 if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 500:
                     os.replace(tmp_path, clip_path)
                     processed += 1
+                    # If atempo was applied the clip duration changed; update
+                    # target_duration to the new on-disk duration so that
+                    # time_stretch_clips doesn't undo the emotion speed change.
+                    if any(f.startswith("atempo=") for f in af_filters):
+                        new_dur = probe_duration(clip_path)
+                        if new_dur and new_dur > 0:
+                            m["target_duration"] = new_dur
             except Exception:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
@@ -1070,6 +1081,7 @@ def _build_stretch_filter(ratio):
     if _RUBBERBAND is None:
         _RUBBERBAND = _rubberband_available()
 
+    ratio = max(ratio, 0.5)
     ratio = min(ratio, 4.0)
 
     if ratio <= 1.3:

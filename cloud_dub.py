@@ -23,6 +23,7 @@ import re
 import struct
 import subprocess
 import sys
+import time
 import wave
 import requests
 
@@ -44,45 +45,6 @@ TTS_TEMPERATURE = 0.15
 TTS_TOP_P = 0.7
 TTS_REPETITION_PENALTY = 1.2
 
-
-# ── ASS Subtitle Parser ────────────────────────────────────────────────────
-def parse_ass(path):
-    dialogues = []
-    with open(path, encoding="utf-8-sig") as f:
-        lines = f.readlines()
-
-    for line in lines:
-        if not line.startswith("Dialogue:"):
-            continue
-        parts = line.split(",", 9)
-        if len(parts) < 10:
-            continue
-
-        style = parts[3].strip()
-        if style.lower() in ("sign", "signs", "credits", "credit", "note"):
-            continue
-
-        def to_sec(ts):
-            h, m, s = ts.strip().split(":")
-            return int(h) * 3600 + int(m) * 60 + float(s)
-
-        start = to_sec(parts[1])
-        end = to_sec(parts[2])
-        text = parts[9].strip()
-        text = re.sub(r"\{[^}]*\}", "", text)
-        text = text.replace("\\N", " ").replace("\\n", " ").strip()
-        if not text or len(text) < 2:
-            continue
-
-        dialogues.append({
-            "start": start, "end": end,
-            "duration": end - start,
-            "style": style, "text": text,
-        })
-
-    dialogues.sort(key=lambda d: d["start"])
-    print(f"  Parsed {len(dialogues)} dialogue lines")
-    return dialogues
 
 
 # ── Gender Detection + Speaker Assignment ───────────────────────────────────
@@ -178,6 +140,11 @@ def add_emotion_tags(text, emotion):
         "intense": "[excited]",
         "surprised": "[surprised]",
         "laughing": "[laughing]",
+        "crying": "[crying]",
+        "angry": "[angry]",
+        "seductive": "[whisper]",
+        "tired": "[whisper]",
+        "playful": "[laughing]",
         "question": "",
         "neutral": "",
     }
@@ -218,41 +185,6 @@ def measure_calmness(wav_path):
     except Exception:
         return None
 
-
-# ── Audio Separation (Demucs) ───────────────────────────────────────────────
-def separate_audio(src_mkv):
-    print("\n=== Step 3: Separating vocals/background (Demucs) ===")
-
-    vocals = os.path.join(WORKDIR, "vocals.wav")
-    bg = os.path.join(WORKDIR, "background.wav")
-
-    if os.path.exists(vocals) and os.path.exists(bg):
-        print("  Cached, skipping.")
-        return vocals, bg
-
-    full_audio = os.path.join(WORKDIR, "full_audio.wav")
-    subprocess.run([
-        "ffmpeg", "-y", "-i", src_mkv,
-        "-vn", "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
-        full_audio
-    ], check=True, capture_output=True)
-
-    separated_dir = os.path.join(WORKDIR, "separated")
-    subprocess.run([
-        sys.executable, "-m", "demucs", "-n", "htdemucs",
-        "--two-stems", "vocals",
-        "-o", separated_dir, full_audio
-    ], check=True)
-
-    src_vocals = os.path.join(separated_dir, "htdemucs", "full_audio", "vocals.wav")
-    src_bg = os.path.join(separated_dir, "htdemucs", "full_audio", "no_vocals.wav")
-
-    import shutil
-    shutil.move(src_vocals, vocals)
-    shutil.move(src_bg, bg)
-    print(f"  Vocals: {vocals}")
-    print(f"  Background: {bg}")
-    return vocals, bg
 
 
 # ── Extract CALM References per Speaker (ported from XTTS) ─────────────────
@@ -402,7 +334,8 @@ def bootstrap_english_refs(dialogues, speaker_refs):
     cache = {}
 
     for spk, jp_ref_path in speaker_refs.items():
-        en_ref_path = os.path.join(refs_dir, f"{spk}_english.wav")
+        spk_safe = dub_common._safe_filename(spk)
+        en_ref_path = os.path.join(refs_dir, f"{spk_safe}_english.wav")
 
         # Skip if already bootstrapped
         if os.path.exists(en_ref_path) and os.path.getsize(en_ref_path) > 1000:
@@ -478,12 +411,12 @@ def bootstrap_english_refs(dialogues, speaker_refs):
                     refs_dir = os.path.join(WORKDIR, "refs")
                     tmp_paths = []
                     for ci, clip_data in enumerate(en_clips):
-                        tmp = os.path.join(refs_dir, f"{spk}_enboot{ci}.wav")
+                        tmp = os.path.join(refs_dir, f"{spk_safe}_enboot{ci}.wav")
                         with open(tmp, "wb") as f:
                             f.write(clip_data)
                         tmp_paths.append(tmp)
 
-                    concat_list = os.path.join(refs_dir, f"{spk}_enconcat.txt")
+                    concat_list = os.path.join(refs_dir, f"{spk_safe}_enconcat.txt")
                     with open(concat_list, "w", encoding="utf-8") as f:
                         for tp in tmp_paths:
                             p = os.path.abspath(tp).replace("\\", "/").replace("'", "\\'")
@@ -561,6 +494,9 @@ def generate_clips(dialogues, speaker_refs, ref_cache):
     clips_dir = os.path.join(WORKDIR, "clips")
     os.makedirs(clips_dir, exist_ok=True)
     failures_path = os.path.join(WORKDIR, "failures.txt")
+    # Clear stale failures file so QA report reflects this run only
+    if os.path.exists(failures_path):
+        os.remove(failures_path)
 
     fallback_ref_b64 = next(iter(ref_cache.values())) if ref_cache else None
     manifest = []
@@ -605,8 +541,16 @@ def generate_clips(dialogues, speaker_refs, ref_cache):
         if d["duration"] < 0.3:
             continue
 
-        # Use pre-cached base64 reference for this speaker
-        ref_b64 = ref_cache.get(d["speaker"], fallback_ref_b64)
+        # Use pre-cached English reference for this speaker.
+        # Fallback chain: own English ref → own JP ref → any other English ref
+        ref_b64 = ref_cache.get(d["speaker"])
+        if not ref_b64:
+            jp_path = speaker_refs.get(d["speaker"])
+            if jp_path and os.path.exists(jp_path):
+                with open(jp_path, "rb") as _f:
+                    ref_b64 = base64.b64encode(_f.read()).decode()
+            else:
+                ref_b64 = fallback_ref_b64
         if not ref_b64:
             continue
 
@@ -635,7 +579,6 @@ def generate_clips(dialogues, speaker_refs, ref_cache):
 
         success = False
         for attempt, (temp, rep_pen) in enumerate(retry_schedule):
-            import time
             if attempt > 0:
                 time.sleep(attempt)  # 1s, 2s backoff
                 if os.path.exists(clip_path):
@@ -718,58 +661,6 @@ def generate_clips(dialogues, speaker_refs, ref_cache):
     print(f"  Generated {len(manifest)} clips | emotions: {emotions}")
     return manifest
 
-
-# ── Post-process clips (emotion-aware pitch/volume/speed) ───────────────────
-def postprocess_clips(manifest):
-    """Apply emotion-aware audio effects to each clip using FFmpeg.
-
-    Exclaim: boost volume + slight pitch up
-    Whisper: lower volume + low-pass filter (breathy)
-    Moaning: slow down slightly + volume boost
-    Intense: slight volume boost
-    Neutral/question: no change
-    """
-    print("\n=== Step 5b: Emotion post-processing ===")
-    processed = 0
-
-    for m in manifest:
-        emotion = m.get("emotion", "neutral")
-        if emotion in ("neutral", "question", "laughing", "surprised"):
-            continue
-
-        clip_path = m["path"]
-        tmp_path = clip_path + ".tmp.wav"
-
-        af_filters = []
-        if emotion == "exclaim":
-            af_filters.append("volume=1.3")
-            af_filters.append("asetrate=44100*1.03,aresample=44100")
-        elif emotion == "whisper":
-            af_filters.append("volume=0.75")
-            af_filters.append("lowpass=f=6000")
-        elif emotion == "moaning":
-            af_filters.append("volume=1.2")
-            af_filters.append("atempo=0.95")
-        elif emotion == "intense":
-            af_filters.append("volume=1.2")
-
-        if af_filters:
-            try:
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", clip_path,
-                    "-af", ",".join(af_filters),
-                    tmp_path
-                ], check=True, capture_output=True)
-                if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 500:
-                    os.replace(tmp_path, clip_path)
-                    processed += 1
-                elif os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-
-    print(f"  Post-processed {processed} clips")
 
 
 # assemble_voice_track and mix_audio removed — use dub_common versions.

@@ -259,15 +259,16 @@ def main():
     # Step 3: Demucs separation (auto-run if needed)
     vocals_path = os.path.join(WORKDIR, "vocals.wav")
     bg_path = os.path.join(WORKDIR, "background.wav")
+    src_mkv = args.src or dub_common.find_mkv_1080()
     if not os.path.exists(vocals_path) or not os.path.exists(bg_path):
-        src_mkv = args.src or dub_common.find_mkv_1080()
         if not src_mkv:
             print("ERROR: No source MKV found for Demucs. Use --src")
             sys.exit(1)
         vocals_path, bg_path = dub_common.separate_audio(src_mkv, WORKDIR)
 
-    # Get total duration
-    total_duration = dub_common.probe_duration(vocals_path)
+    # Probe duration from source MKV — Demucs may pad output to chunk boundaries,
+    # which would cause the voice track to be longer than the video.
+    total_duration = dub_common.probe_duration(src_mkv) if src_mkv else dub_common.probe_duration(vocals_path)
     print(f"\n  Audio duration: {total_duration:.1f}s ({total_duration/60:.1f} min)")
 
     # Step 4: Voice references (fallback: extracted > training_data > voices/)
@@ -280,16 +281,17 @@ def main():
         dialogues, vocals_path, WORKDIR,
         min_dur=3.0, max_dur=10.0, target_seconds=10.0
     )
-    # Convert extracted {speaker: wav_path} to full ref format
-    extracted_full = {spk: (path, "", []) for spk, path in extracted.items()}
     # Build gender map from dialogues for named character fallback
     speaker_genders = {}
     for d in dialogues:
         spk = d.get("speaker", "")
         if spk and spk not in speaker_genders:
             speaker_genders[spk] = d.get("gender", "female")
+    # Pass extracted {spk: wav_path} directly — resolve_voice_refs wraps to
+    # (wav_path, prompt_text, aux_paths) internally. Wrapping here first caused
+    # ref_path to receive a tuple instead of a string, crashing tts.run().
     speaker_refs = dub_common.resolve_voice_refs(
-        extracted_full, voices_dir, training_dir=training_dir,
+        extracted, voices_dir, training_dir=training_dir,
         speaker_genders=speaker_genders
     )
 
