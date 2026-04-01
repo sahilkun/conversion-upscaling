@@ -68,8 +68,14 @@ def generate_clips(tts, dialogues, speaker_refs):
         volume_factor = d.get("volume_factor", 1.0)
         emotions[emotion] = emotions.get(emotion, 0) + 1
 
-        # Skip if already generated (resume support)
+        # Skip if already generated (resume support) — verify WAV is readable
         if os.path.exists(clip_path) and os.path.getsize(clip_path) > 1000:
+            try:
+                with wave.open(clip_path, "rb") as _wf:
+                    if _wf.getnframes() == 0:
+                        raise ValueError("empty WAV")
+            except Exception:
+                os.remove(clip_path)  # corrupted — regenerate
             manifest.append({
                 "path": clip_path, "start": d["start"],
                 "target_duration": d["duration"],

@@ -197,6 +197,25 @@ def llm_label_speakers(dialogues, workdir, api_key=None):
         # Normalize keys to lowercase
         speaker_map = {k.lower(): v for k, v in speaker_map.items()}
 
+        # Validate schema: each value must be a dict with name + gender
+        valid = {}
+        for style, entry in speaker_map.items():
+            if not isinstance(entry, dict):
+                print(f"  LLM map: skipping '{style}' — value is not a dict ({entry!r})")
+                continue
+            name = entry.get("name", "").strip()
+            gender = entry.get("gender", "").strip().lower()
+            if not name:
+                entry["name"] = style  # fall back to style name
+            if gender not in ("male", "female"):
+                entry["gender"] = "female"  # safe default
+            valid[style] = entry
+        speaker_map = valid
+
+        if not speaker_map:
+            print("  LLM map returned no valid entries, falling back to auto-detect")
+            return {}
+
         os.makedirs(workdir, exist_ok=True)
         with open(cache_path, "w", encoding="utf-8") as f:
             json.dump(speaker_map, f, indent=2)
@@ -343,14 +362,25 @@ def separate_audio(src_mkv, workdir):
 
     # Run Demucs
     separated_dir = os.path.join(workdir, "separated")
-    subprocess.run([
+    result = subprocess.run([
         sys.executable, "-m", "demucs", "-n", "htdemucs",
         "--two-stems", "vocals",
         "-o", separated_dir, full_audio
-    ], check=True)
+    ])
+    if result.returncode != 0:
+        raise RuntimeError(f"Demucs failed with exit code {result.returncode}. "
+                           "Check that demucs is installed: pip install demucs")
 
     src_vocals = os.path.join(separated_dir, "htdemucs", "full_audio", "vocals.wav")
     src_bg = os.path.join(separated_dir, "htdemucs", "full_audio", "no_vocals.wav")
+
+    if not os.path.exists(src_vocals):
+        raise FileNotFoundError(
+            f"Demucs output not found: {src_vocals}\n"
+            "Expected path may differ — check separated/ folder structure."
+        )
+    if not os.path.exists(src_bg):
+        raise FileNotFoundError(f"Demucs background output not found: {src_bg}")
 
     shutil.move(src_vocals, vocals)
     shutil.move(src_bg, bg)
@@ -527,11 +557,14 @@ def extract_calm_refs(dialogues, vocals_path, workdir,
                     "-acodec", "pcm_s16le", silence_path
                 ], check=True, capture_output=True)
 
-            with open(concat_list, "w") as f:
+            with open(concat_list, "w", encoding="utf-8") as f:
                 for ci, clip in enumerate(chosen):
-                    f.write(f"file '{os.path.abspath(clip)}'\n")
+                    # FFmpeg concat demuxer requires forward slashes and escaped single quotes
+                    p = os.path.abspath(clip).replace("\\", "/").replace("'", "\\'")
+                    f.write(f"file '{p}'\n")
                     if ci < len(chosen) - 1:
-                        f.write(f"file '{os.path.abspath(silence_path)}'\n")
+                        sp = os.path.abspath(silence_path).replace("\\", "/").replace("'", "\\'")
+                        f.write(f"file '{sp}'\n")
 
             subprocess.run([
                 "ffmpeg", "-y", "-f", "concat", "-safe", "0",
@@ -798,29 +831,50 @@ def normalize_clips(manifest):
     """Normalize each clip to -20 LUFS for consistent per-line volume.
 
     Runs ffmpeg loudnorm on every clip in-place. Skips clips that fail.
+    Skips clips shorter than 0.5s — loudnorm needs ≥3s analysis window but
+    produces acceptable results down to ~0.5s; below that, use peak norm instead.
     Call after time_stretch_clips, before assemble_voice_track.
     """
     print("\n=== Normalizing clip volumes (loudnorm -20 LUFS) ===")
     normalized = 0
+    peak_normalized = 0
 
     for m in manifest:
         clip = m["path"]
         tmp = clip + ".norm.wav"
+
         try:
-            subprocess.run([
-                "ffmpeg", "-y", "-i", clip,
-                "-af", "loudnorm=I=-20:TP=-2:LRA=7",
-                "-ar", "44100", tmp
-            ], check=True, capture_output=True)
-            if os.path.exists(tmp) and os.path.getsize(tmp) > 500:
-                os.replace(tmp, clip)
-                normalized += 1
+            dur = probe_duration(clip)
+        except Exception:
+            continue
+
+        try:
+            if dur >= 0.5:
+                # loudnorm for normal-length clips
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", clip,
+                    "-af", "loudnorm=I=-20:TP=-2:LRA=7",
+                    "-ar", "44100", tmp
+                ], check=True, capture_output=True)
+                if os.path.exists(tmp) and os.path.getsize(tmp) > 500:
+                    os.replace(tmp, clip)
+                    normalized += 1
+            else:
+                # Peak normalization for very short clips (<0.5s)
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", clip,
+                    "-af", "dynaudnorm=p=0.95",
+                    "-ar", "44100", tmp
+                ], check=True, capture_output=True)
+                if os.path.exists(tmp) and os.path.getsize(tmp) > 500:
+                    os.replace(tmp, clip)
+                    peak_normalized += 1
         except Exception:
             if os.path.exists(tmp):
                 os.remove(tmp)
 
-    print(f"  Normalized {normalized}/{len(manifest)} clips")
-    return normalized
+    print(f"  Normalized {normalized} clips (loudnorm) + {peak_normalized} (peak)")
+    return normalized + peak_normalized
 
 
 def _rubberband_available():
@@ -986,6 +1040,9 @@ def resolve_overlaps(manifest):
 def assemble_voice_track(manifest, total_duration, workdir, sample_rate=44100):
     """Place all clips on timeline, normalize, write WAV. Returns output path."""
     print("\n=== Assembling English voice track ===")
+
+    # Ensure chronological order — out-of-order clips corrupt the timeline
+    manifest = sorted(manifest, key=lambda m: m["start"])
 
     total_samples = int(total_duration * sample_rate)
     timeline = array.array('d', [0.0]) * total_samples

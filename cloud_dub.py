@@ -349,11 +349,13 @@ def extract_references(dialogues, vocals_path):
                     "-acodec", "pcm_s16le", silence_path
                 ], check=True, capture_output=True)
 
-            with open(concat_list, "w") as f:
+            with open(concat_list, "w", encoding="utf-8") as f:
                 for ci, clip in enumerate(chosen):
-                    f.write(f"file '{os.path.abspath(clip)}'\n")
+                    p = os.path.abspath(clip).replace("\\", "/").replace("'", "\\'")
+                    f.write(f"file '{p}'\n")
                     if ci < len(chosen) - 1:
-                        f.write(f"file '{os.path.abspath(silence_path)}'\n")
+                        sp = os.path.abspath(silence_path).replace("\\", "/").replace("'", "\\'")
+                        f.write(f"file '{sp}'\n")
 
             subprocess.run([
                 "ffmpeg", "-y", "-f", "concat", "-safe", "0",
@@ -479,9 +481,10 @@ def bootstrap_english_refs(dialogues, speaker_refs):
                         tmp_paths.append(tmp)
 
                     concat_list = os.path.join(refs_dir, f"{spk}_enconcat.txt")
-                    with open(concat_list, "w") as f:
+                    with open(concat_list, "w", encoding="utf-8") as f:
                         for tp in tmp_paths:
-                            f.write(f"file '{os.path.abspath(tp)}'\n")
+                            p = os.path.abspath(tp).replace("\\", "/").replace("'", "\\'")
+                            f.write(f"file '{p}'\n")
 
                     subprocess.run([
                         "ffmpeg", "-y", "-f", "concat", "-safe", "0",
@@ -557,8 +560,14 @@ def generate_clips(dialogues, speaker_refs, ref_cache):
         volume_factor = d.get("volume_factor", 1.0)
         emotions[emotion] = emotions.get(emotion, 0) + 1
 
-        # Skip if already generated (resume support)
+        # Skip if already generated (resume support) — verify WAV is readable
         if os.path.exists(clip_path) and os.path.getsize(clip_path) > 1000:
+            try:
+                with wave.open(clip_path, "rb") as _wf:
+                    if _wf.getnframes() == 0:
+                        raise ValueError("empty WAV")
+            except Exception:
+                os.remove(clip_path)  # corrupted — regenerate
             manifest.append({
                 "path": clip_path,
                 "start": d["start"],
