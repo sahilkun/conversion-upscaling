@@ -302,6 +302,10 @@ def main():
     # Step 9: Mix final audio
     dub_common.mix_audio(voice_path, abs_vocals, abs_bg, manifest, abs_output)
 
+    # Step 10: QA report + listening samples
+    dub_common.generate_qa_report(manifest, dialogues, WORKDIR, total_duration)
+    dub_common.export_listen_samples(abs_output, WORKDIR)
+
     print(f"\n=== DONE! Output: {abs_output} ===")
 
 

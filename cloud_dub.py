@@ -912,6 +912,10 @@ def main():
     # Step 7: Mix with smart ducking
     dub_common.mix_audio(voice_path, vocals, bg, manifest, args.output)
 
+    # Step 8: QA report + listening samples
+    dub_common.generate_qa_report(manifest, dialogues, WORKDIR, total_duration)
+    dub_common.export_listen_samples(args.output, WORKDIR)
+
     print(f"\n=== DONE! ===")
     print(f"Output: {args.output}")
 

@@ -1072,6 +1072,161 @@ def mix_audio(voice_path, vocals_path, bg_path, manifest, output_path):
     print(f"  Final dub: {output_path} ({size_mb:.1f} MB)")
 
 
+# ── QA Report ────────────────────────────────────────────────────────────────
+
+def generate_qa_report(manifest, dialogues, workdir, total_duration):
+    """Generate a QA report after dubbing. Writes dub_work/qa_report.txt.
+
+    Covers: generation rate, failed lines, timing accuracy, emotion breakdown,
+    speaker breakdown, time-stretched clips, and duration validation.
+    """
+    import datetime
+
+    report_path = os.path.join(workdir, "qa_report.txt")
+    failures_path = os.path.join(workdir, "failures.txt")
+
+    total_lines = len(dialogues)
+    generated = len(manifest)
+    failed_lines = []
+    if os.path.exists(failures_path):
+        with open(failures_path, encoding="utf-8") as f:
+            failed_lines = [l.strip() for l in f if l.strip()]
+
+    # Emotion distribution
+    emotion_dist = {}
+    for d in dialogues:
+        e = d.get("emotion", "neutral")
+        emotion_dist[e] = emotion_dist.get(e, 0) + 1
+
+    # Speaker distribution
+    speaker_dist = {}
+    for d in dialogues:
+        s = d.get("speaker", "unknown")
+        speaker_dist[s] = speaker_dist.get(s, 0) + 1
+
+    # Timing accuracy: compare clip duration vs target
+    duration_deltas = []
+    stretched = 0
+    tight_fits = 0  # clips within 10% of target
+    for m in manifest:
+        try:
+            actual = probe_duration(m["path"])
+            target = m["target_duration"]
+            delta = actual - target
+            duration_deltas.append(delta)
+            ratio = actual / target if target > 0 else 1.0
+            if ratio > 1.1:
+                stretched += 1
+            if abs(delta) <= target * 0.1:
+                tight_fits += 1
+        except Exception:
+            pass
+
+    avg_delta = sum(duration_deltas) / len(duration_deltas) if duration_deltas else 0.0
+    max_over = max((d for d in duration_deltas if d > 0), default=0.0)
+
+    # Total voice coverage (how much of the video has English speech)
+    voice_seconds = sum(m["target_duration"] for m in manifest)
+    coverage_pct = (voice_seconds / total_duration * 100) if total_duration > 0 else 0.0
+
+    lines = [
+        f"Dubbing QA Report — {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        "=" * 60,
+        "",
+        "── Generation ──────────────────────────────────────────────",
+        f"  Lines total:      {total_lines}",
+        f"  Lines generated:  {generated}  ({generated/total_lines*100:.1f}%)" if total_lines else "  Lines generated:  0",
+        f"  Lines failed:     {len(failed_lines)}",
+        f"  Voice coverage:   {voice_seconds:.1f}s / {total_duration:.1f}s  ({coverage_pct:.1f}%)",
+        "",
+        "── Timing Accuracy ─────────────────────────────────────────",
+        f"  Avg duration delta:  {avg_delta:+.3f}s  (+ = clip longer than target)",
+        f"  Max overrun:         {max_over:.3f}s",
+        f"  Tight fits (±10%):   {tight_fits}/{generated}",
+        f"  Time-stretched:      {stretched}",
+        "",
+        "── Emotion Distribution ────────────────────────────────────",
+    ]
+    for emotion, count in sorted(emotion_dist.items(), key=lambda x: -x[1]):
+        pct = count / total_lines * 100 if total_lines else 0
+        lines.append(f"  {emotion:<12} {count:>4}  ({pct:.1f}%)")
+
+    lines += [
+        "",
+        "── Speaker Distribution ────────────────────────────────────",
+    ]
+    for spk, count in sorted(speaker_dist.items(), key=lambda x: -x[1]):
+        pct = count / total_lines * 100 if total_lines else 0
+        lines.append(f"  {spk:<20} {count:>4}  ({pct:.1f}%)")
+
+    if failed_lines:
+        lines += [
+            "",
+            "── Failed Lines ────────────────────────────────────────────",
+        ]
+        for fl in failed_lines:
+            lines.append(f"  {fl}")
+
+    lines += ["", "=" * 60]
+
+    report_text = "\n".join(lines) + "\n"
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(report_text)
+
+    print(f"\n=== QA Report ===")
+    print(report_text)
+    return report_path
+
+
+def export_listen_samples(dub_path, workdir, n=5, clip_len=30):
+    """Export N evenly-spaced 30s clips from the final dub for quick listening check.
+
+    Skips first and last 5% of the dub (intros/outros tend to be music only).
+    Saves to dub_work/samples/sample_01.wav ... sample_N.wav.
+    """
+    print(f"\n=== Exporting {n} listening samples ({clip_len}s each) ===")
+    samples_dir = os.path.join(workdir, "samples")
+    os.makedirs(samples_dir, exist_ok=True)
+
+    try:
+        total = probe_duration(dub_path)
+    except Exception as e:
+        print(f"  Could not probe dub duration: {e}")
+        return
+
+    usable_start = total * 0.05
+    usable_end = total * 0.95
+    usable = usable_end - usable_start
+
+    if usable < clip_len:
+        print(f"  Dub too short for samples ({total:.1f}s)")
+        return
+
+    # Evenly space N start points across usable range
+    if n == 1:
+        starts = [usable_start + usable / 2 - clip_len / 2]
+    else:
+        step = (usable - clip_len) / (n - 1)
+        starts = [usable_start + i * step for i in range(n)]
+
+    exported = 0
+    for i, start in enumerate(starts):
+        out_path = os.path.join(samples_dir, f"sample_{i+1:02d}.wav")
+        try:
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-ss", f"{start:.3f}", "-t", f"{clip_len}",
+                "-i", dub_path,
+                "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
+                out_path
+            ], check=True, capture_output=True)
+            exported += 1
+        except Exception as e:
+            print(f"  Sample {i+1} failed: {e}")
+
+    print(f"  Exported {exported}/{n} samples → {samples_dir}")
+
+
 # ── MKV Auto-Detection ────────────────────────────────────────────────────────
 
 def find_mkv_1080(directory="."):
