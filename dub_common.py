@@ -823,14 +823,64 @@ def normalize_clips(manifest):
     return normalized
 
 
+def _rubberband_available():
+    """Check if FFmpeg was built with the rubberband filter."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-filters"],
+            capture_output=True, text=True
+        )
+        return "rubberband" in result.stdout
+    except Exception:
+        return False
+
+
+# Cache rubberband availability — checked once per process
+_RUBBERBAND = None
+
+
+def _build_stretch_filter(ratio):
+    """Return the best FFmpeg -af filter string for the given tempo ratio.
+
+    Strategy:
+      ratio <= 1.3  → atempo (fast, imperceptible quality diff at low ratios)
+      ratio 1.3–4.0 → rubberband if available (much better at high ratios),
+                       else chained atempo
+      ratio > 4.0   → capped at 4.0 with warning
+    """
+    global _RUBBERBAND
+    if _RUBBERBAND is None:
+        _RUBBERBAND = _rubberband_available()
+
+    ratio = min(ratio, 4.0)
+
+    if ratio <= 1.3:
+        return f"atempo={ratio:.4f}", "atempo"
+
+    if _RUBBERBAND:
+        # rubberband: tempo=ratio, pitch=1.0 (preserve pitch)
+        return f"rubberband=tempo={ratio:.4f}:pitch=1.0", "rubberband"
+
+    # Fallback: chained atempo (max 2.0 per stage)
+    if ratio <= 2.0:
+        return f"atempo={ratio:.4f}", "atempo"
+    r1 = ratio ** 0.5
+    return f"atempo={r1:.4f},atempo={r1:.4f}", "atempo-chain"
+
+
 def time_stretch_clips(manifest):
     """Pitch-preserving time-stretch for clips exceeding target duration.
 
-    Uses FFmpeg atempo (0.5–2.0x). For ratios >2.0x, chains two atempo filters.
-    Removes the 1.15x cap — will stretch up to 2.0x to fit subtitle window.
+    Uses rubberband filter (high quality) when available, falls back to
+    chained atempo. rubberband handles ratios up to 4x without artifacts.
     """
-    print("\n=== Time-stretching long clips ===")
+    global _RUBBERBAND
+    if _RUBBERBAND is None:
+        _RUBBERBAND = _rubberband_available()
+
+    print(f"\n=== Time-stretching long clips (engine: {'rubberband' if _RUBBERBAND else 'atempo'}) ===")
     stretched = 0
+    methods = {}
 
     for m in manifest:
         clip = m["path"]
@@ -842,21 +892,17 @@ def time_stretch_clips(manifest):
         target = m["target_duration"]
         if dur > target * 1.1 and target > 0.3:
             ratio = dur / target
-            ratio = min(ratio, 4.0)  # hard cap: never compress more than 4x
-
-            # atempo is capped at 2.0; chain two filters if needed
-            if ratio <= 2.0:
-                af = f"atempo={ratio:.4f}"
-            else:
-                # e.g. ratio=3.0 -> atempo=1.732,atempo=1.732 (sqrt(3))
-                r1 = ratio ** 0.5
-                af = f"atempo={r1:.4f},atempo={r1:.4f}"
+            if ratio > 4.0:
+                print(f"  WARNING: ratio {ratio:.2f}x capped at 4.0x for {os.path.basename(clip)}")
+            af, method = _build_stretch_filter(ratio)
+            methods[method] = methods.get(method, 0) + 1
 
             tmp = clip + ".tempo.wav"
             try:
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", clip, "-af", af, tmp
-                ], check=True, capture_output=True)
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", clip, "-af", af, tmp],
+                    check=True, capture_output=True
+                )
                 if os.path.exists(tmp) and os.path.getsize(tmp) > 500:
                     os.replace(tmp, clip)
                     stretched += 1
@@ -864,7 +910,8 @@ def time_stretch_clips(manifest):
                 if os.path.exists(tmp):
                     os.remove(tmp)
 
-    print(f"  Stretched {stretched} clips (pitch-preserving atempo, up to 4x)")
+    method_summary = ", ".join(f"{m}:{n}" for m, n in methods.items()) if methods else "none"
+    print(f"  Stretched {stretched} clips ({method_summary})")
     return stretched
 
 
