@@ -384,8 +384,7 @@ def bootstrap_english_refs(dialogues, speaker_refs):
                             os.remove(tmp)
 
                     if not tmp_paths:
-                        # All bootstrap clips were invalid — treat as no clips
-                        en_clips = []
+                        pass  # all invalid — en_ref_path won't be written; fallback below
                     else:
                         concat_list = os.path.join(refs_dir, f"{spk_safe}_enconcat.txt")
                         with open(concat_list, "w", encoding="utf-8") as f:

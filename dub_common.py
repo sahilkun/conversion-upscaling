@@ -570,12 +570,19 @@ def _snr_ok(wav_path, min_snr_db=10.0):
         noise_floor = sum(frame_rms[:max(1, len(frame_rms) // 10)]) / max(1, len(frame_rms) // 10)
         signal = sum(frame_rms[-(len(frame_rms) // 4):]) / (len(frame_rms) // 4)
 
-        if noise_floor < 1:
-            # Near-silence: clip is too quiet to be useful as a voice reference.
-            # Reject rather than accept (a silent ref produces a silent TTS output).
-            return False
-
         import math
+        # Reject clips where signal itself is near-zero (clip is silent speech).
+        # A clean voice clip with quiet inter-word gaps will have noise_floor ≈ 0
+        # (silent between words) but a healthy signal level, so we must not reject
+        # based on noise_floor alone.
+        if signal < 1:
+            return False  # essentially silent — useless as a voice reference
+
+        # Guard against log10(0) when noise_floor is pure silence (gap frames only).
+        # A zero noise floor means infinite SNR — accept the clip.
+        if noise_floor < 1:
+            return True
+
         snr = 20 * math.log10(signal / noise_floor)
         return snr >= min_snr_db
     except Exception:
@@ -660,7 +667,11 @@ def extract_calm_refs(dialogues, vocals_path, workdir,
                 if _snr_ok(ref_path):
                     scored.append((score, ref_path, d["duration"]))
                 else:
-                    os.remove(ref_path)  # reject BGM-contaminated ref
+                    # Keep cand0 alive as a last-resort fallback in case all
+                    # candidates fail SNR — it will be cleaned up by the cand
+                    # cleanup loop at the end if it's not used.
+                    if idx > 0:
+                        os.remove(ref_path)  # reject BGM-contaminated ref
 
         if not scored:
             # All candidates failed SNR check (heavy background music).
@@ -1214,7 +1225,7 @@ def resolve_overlaps(manifest):
                 try:
                     subprocess.run(
                         ["ffmpeg", "-y", "-i", clip,
-                         "-af", f"atrim=end={new_target:.4f},asetpts=PTS-STARTPTS",
+                         "-af", f"atrim=start=0:end={new_target:.4f},asetpts=PTS-STARTPTS",
                          tmp],
                         check=True, capture_output=True
                     )
@@ -1236,12 +1247,12 @@ def resolve_overlaps(manifest):
                 new_target = nxt["start"] - cur["start"]
                 if new_target > 0.1:
                     clip = cur["path"]
+                    tmp = clip + ".overlap.wav"
                     try:
                         dur = probe_duration(clip)
                         ratio = dur / new_target
                         ratio = min(ratio, 4.0)
                         af, _ = _build_stretch_filter(ratio)
-                        tmp = clip + ".overlap.wav"
                         subprocess.run(
                             ["ffmpeg", "-y", "-i", clip, "-af", af, tmp],
                             check=True, capture_output=True
@@ -1379,19 +1390,21 @@ def mix_audio(voice_path, vocals_path, bg_path, manifest, output_path):
     #    threshold=0.02 (~-34dBFS) triggers on voice, ratio=10 gives ~10x attenuation
     # 4. Final mix + dynamics + loudnorm
     # sidechaincompress requires sidechain channel count to match the main signal.
-    # JP vocals from Demucs are stereo; English voice (sidechain) is mono.
-    # Explicitly upmix the mono sidechain to stereo to avoid channel layout
-    # mismatch crash on FFmpeg < 7 (and deprecation warning on FFmpeg 7+).
+    # [0]=English voice (mono), [1]=JP vocals (stereo from Demucs, but may be mono
+    # for single-channel source audio), [2]=background (same).
+    # Force all streams to stereo before mixing so sidechaincompress always
+    # receives matching channel counts regardless of Demucs output format.
     filter_complex = (
         "[0]asplit=2[en_raw][en_sc];"
         "[en_raw]asplit[vl][vr];"
         "[vr]adelay=20ms[vrd];"
         "[vl][vrd]amerge[en];"
         "[en_sc]pan=stereo|c0=c0|c1=c0[en_sc_st];"
-        "[1][en_sc_st]sidechaincompress="
+        "[1]aformat=channel_layouts=stereo[ja_st];"
+        "[ja_st][en_sc_st]sidechaincompress="
         "threshold=0.02:ratio=10:attack=5:release=200:makeup=1[ja_sc];"
         "[ja_sc]volume=0.7[ja];"
-        "[2]volume=0.8[bg];"
+        "[2]aformat=channel_layouts=stereo[bg];"
         "[en][ja][bg]amix=inputs=3:duration=longest:normalize=0,"
         "compand=attacks=0.05:decays=0.3:points=-80/-80|-30/-15|-10/-8|0/-6:soft-knee=6:gain=4,"
         "loudnorm=I=-16:TP=-1.5:LRA=7[out]"
