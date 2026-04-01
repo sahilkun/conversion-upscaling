@@ -60,6 +60,9 @@ def generate_clips(tts, dialogues, speaker_refs):
     clips_dir = os.path.join(WORKDIR, "clips")
     os.makedirs(clips_dir, exist_ok=True)
     failures_path = os.path.join(WORKDIR, "failures.txt")
+    # Clear stale failures file so QA report reflects this run only
+    if os.path.exists(failures_path):
+        os.remove(failures_path)
 
     import soundfile as sf
 

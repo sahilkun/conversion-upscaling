@@ -521,8 +521,12 @@ def fingerprints_consistent(fp_baseline, fp_new, tolerance=0.35):
     if fp_baseline is None or fp_new is None:
         return True  # can't check, assume OK
     for b, n in zip(fp_baseline, fp_new):
-        if b == 0:
-            continue
+        if abs(b) < 1e-6:
+            # Baseline near-zero: skip only if new is also near-zero.
+            # A nonzero new value against a zero baseline signals drift.
+            if abs(n) < 1e-6:
+                continue
+            return False
         if abs(n - b) / abs(b) > tolerance:
             return False
     return True
@@ -563,8 +567,8 @@ def _snr_ok(wav_path, min_snr_db=10.0):
             if rms > 0:
                 frame_rms.append(rms)
 
-        if len(frame_rms) < 4:
-            return True  # need ≥4 frames so len//4 >= 1 (avoids ZeroDivisionError)
+        if len(frame_rms) < 8:
+            return True  # need ≥8 frames so signal window (len//4) has ≥2 samples
 
         frame_rms.sort()
         noise_floor = sum(frame_rms[:max(1, len(frame_rms) // 10)]) / max(1, len(frame_rms) // 10)
@@ -655,12 +659,16 @@ def extract_calm_refs(dialogues, vocals_path, workdir,
             start = max(0, d["start"] - pad)
             length = d["duration"] + pad * 2
 
-            subprocess.run([
-                "ffmpeg", "-y", "-ss", f"{start:.3f}", "-t", f"{length:.3f}",
-                "-i", vocals_path,
-                "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1",
-                ref_path
-            ], check=True, capture_output=True)
+            try:
+                subprocess.run([
+                    "ffmpeg", "-y", "-ss", f"{start:.3f}", "-t", f"{length:.3f}",
+                    "-i", vocals_path,
+                    "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1",
+                    ref_path
+                ], check=True, capture_output=True)
+            except Exception as _extract_err:
+                print(f"    WARNING: candidate {idx} extraction failed: {_extract_err}")
+                continue
 
             score = measure_calmness(ref_path)
             if score is not None:
@@ -975,11 +983,11 @@ def postprocess_clips(manifest):
 
         af_filters = []
         if emotion == "exclaim":
-            # Louder + slight pitch up for energy
-            af_filters += ["volume=1.3", "asetrate=44100*1.03,aresample=44100"]
+            # Louder + slight pitch up for energy (+3 semitones ≈ 1.03x rate)
+            af_filters += ["volume=1.3", "asetrate=45423,aresample=44100"]
         elif emotion == "angry":
             # Louder + slight pitch up + subtle distortion edge via treble boost
-            af_filters += ["volume=1.35", "asetrate=44100*1.04,aresample=44100",
+            af_filters += ["volume=1.35", "asetrate=45864,aresample=44100",
                            "equalizer=f=3000:width_type=o:width=2:g=3"]
         elif emotion == "whisper":
             # Quieter + low-pass (breathy, muffled)
@@ -1069,9 +1077,10 @@ def normalize_clips(manifest):
                 if os.path.exists(tmp) and os.path.getsize(tmp) > 500:
                     os.replace(tmp, clip)
                     peak_normalized += 1
-        except Exception:
+        except Exception as _norm_err:
             if os.path.exists(tmp):
                 os.remove(tmp)
+            print(f"  WARNING: normalize failed for {os.path.basename(clip)}: {_norm_err}")
 
     print(f"  Normalized {normalized} clips (loudnorm) + {peak_normalized} (peak)")
     return normalized + peak_normalized
@@ -1220,6 +1229,8 @@ def resolve_overlaps(manifest):
                 # Trim: truncate the on-disk clip so it doesn't bleed into the
                 # next subtitle's region in the amix timeline.
                 new_target = nxt["start"] - cur["start"]
+                if new_target < 0.05:
+                    continue  # too short to trim usefully; leave as-is
                 clip = cur["path"]
                 tmp = clip + ".trim.wav"
                 try:
@@ -1333,7 +1344,7 @@ def assemble_voice_track(manifest, total_duration, workdir, sample_rate=44100):
     )
 
     with open(script_path, "w", encoding="utf-8") as f:
-        f.write(";\n".join(filter_lines) + "\n")  # trailing newline required by some FFmpeg builds
+        f.write(";\n".join(filter_lines) + ";\n")  # trailing semicolon+newline for all FFmpeg versions
 
     args += [
         "-filter_complex_script", script_path,
