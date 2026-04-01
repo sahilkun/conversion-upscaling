@@ -585,19 +585,21 @@ def generate_clips(dialogues, speaker_refs, ref_cache):
                 with wave.open(clip_path, "rb") as _wf:
                     if _wf.getnframes() == 0:
                         raise ValueError("empty WAV")
+                # Only append to manifest if WAV verified intact
+                manifest.append({
+                    "path": clip_path,
+                    "start": d["start"],
+                    "target_duration": d["duration"],
+                    "emotion": emotion,
+                    "speed_factor": speed_factor,
+                    "volume_factor": volume_factor,
+                })
+                if (i + 1) % 25 == 0:
+                    print(f"  Progress: {i+1}/{len(dialogues)} (cached)")
+                continue
             except Exception:
-                os.remove(clip_path)  # corrupted — regenerate
-            manifest.append({
-                "path": clip_path,
-                "start": d["start"],
-                "target_duration": d["duration"],
-                "emotion": emotion,
-                "speed_factor": speed_factor,
-                "volume_factor": volume_factor,
-            })
-            if (i + 1) % 25 == 0:
-                print(f"  Progress: {i+1}/{len(dialogues)} (cached)")
-            continue
+                if os.path.exists(clip_path):
+                    os.remove(clip_path)  # corrupted — fall through to regenerate
 
         if d["duration"] < 0.3:
             continue

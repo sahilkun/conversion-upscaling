@@ -108,11 +108,13 @@ def generate_clips(tts, dialogues, speaker_refs):
         word_count = len(d["text"].split())
         max_expected = max(d["duration"] * 2.5, word_count * 0.8)
 
-        # Pre-predict English duration — English averages ~2.8 words/sec
-        est_duration = word_count / 2.8
-        speed_factor = 1.0
+        # Start with emotion speed (e.g. 0.95 moaning, 1.1 exclaim), then
+        # override only if word-count estimate predicts a larger speedup is needed
+        speed_factor = d.get("speed_factor", 1.0)
+        est_duration = word_count / 2.8  # English averages ~2.8 words/sec
         if est_duration > d["duration"] * 1.15 and d["duration"] > 0.5:
-            speed_factor = min(est_duration / d["duration"], 1.4)  # cap at 1.4x
+            word_speed = min(est_duration / d["duration"], 1.4)
+            speed_factor = max(speed_factor, word_speed)  # take larger of the two
 
         try:
             # Pad short text to prevent GPT-SoVITS stutter on single words
@@ -141,10 +143,17 @@ def generate_clips(tts, dialogues, speaker_refs):
                 "speed_factor": speed_factor,
             }
 
-            # Generate clip — per-speaker seed for voice consistency
+            # Generate clip — collect ALL chunks from generator then concatenate
+            # (break after first chunk truncates long lines with multiple outputs)
+            import numpy as np
+            chunks = []
+            out_sr = None
             for sr, audio in tts.run(inputs):
-                sf.write(clip_path, audio, sr)
-                break
+                chunks.append(audio)
+                out_sr = sr
+            if chunks and out_sr:
+                full_audio = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+                sf.write(clip_path, full_audio, out_sr)
 
             # Quality check — discard if repetition loop (way too long)
             if os.path.exists(clip_path):

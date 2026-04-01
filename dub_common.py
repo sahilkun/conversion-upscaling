@@ -19,6 +19,35 @@ import wave
 SAMPLE_RATE = 44100
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _safe_filename(name):
+    """Sanitize a speaker name for use as a filename on Windows.
+
+    Removes chars illegal on Windows (<>:"/\\|?* and control chars),
+    strips trailing spaces/dots, and truncates to 64 chars.
+    """
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name)
+    safe = safe.rstrip(' .')
+    return (safe[:64] or "speaker")
+
+
+def _ffmpeg_run(args, **kwargs):
+    """Run FFmpeg, re-raising CalledProcessError with readable stderr.
+
+    Without this, all FFmpeg errors produce an unhelpful 'returned non-zero
+    exit status 1' with no indication of what went wrong.
+    """
+    try:
+        return subprocess.run(args, check=True, capture_output=True, **kwargs)
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode("utf-8", errors="replace").strip()
+        last_lines = "\n".join(stderr.splitlines()[-12:])
+        raise RuntimeError(
+            f"FFmpeg failed (exit {e.returncode}):\n{last_lines}"
+        ) from e
+
+
 # ── Subtitle Parsing ─────────────────────────────────────────────────────────
 
 def parse_ass(path):
@@ -248,8 +277,14 @@ def assign_speakers(dialogues, labels_path=None, speaker_map=None):
                 dialogues[label_idx]["gender"] = speaker
         for d in dialogues:
             if "speaker" not in d:
-                d["speaker"] = "female"
-                d["gender"] = "female"
+                # Fallback: use ASS style name if it looks like a character,
+                # otherwise use keyword gender detection rather than hard-coding female.
+                if _is_character_style(d.get("style", "")):
+                    d["speaker"] = d["style"]
+                else:
+                    gender = detect_gender(d["text"]) or "female"
+                    d["speaker"] = gender
+                d["gender"] = detect_gender(d["text"]) or "female"
 
     elif speaker_map:
         print(f"  Using LLM speaker map ({len(speaker_map)} character styles)...")
@@ -409,9 +444,13 @@ def _voice_fingerprint(wav_path, max_samples=44100):
     try:
         with wave.open(wav_path, "rb") as wf:
             nch = wf.getnchannels()
+            sw = wf.getsampwidth()
             fr = wf.getframerate()
             n = min(wf.getnframes(), max_samples)
             raw = wf.readframes(n)
+
+        if sw != 2:
+            return None  # not 16-bit PCM — caller used unexpected format
 
         samples = struct.unpack(f"<{len(raw)//2}h", raw)
         if nch == 2:
@@ -585,9 +624,10 @@ def extract_calm_refs(dialogues, vocals_path, workdir,
     for spk, candidates in speaker_candidates.items():
         print(f"  {spk}: evaluating {len(candidates)} candidates...")
 
+        spk_safe = _safe_filename(spk)
         scored = []
         for idx, (i, d) in enumerate(candidates):
-            ref_path = os.path.join(refs_dir, f"{spk}_cand{idx}.wav")
+            ref_path = os.path.join(refs_dir, f"{spk_safe}_cand{idx}.wav")
             pad = 0.3
             start = max(0, d["start"] - pad)
             length = d["duration"] + pad * 2
@@ -607,8 +647,8 @@ def extract_calm_refs(dialogues, vocals_path, workdir,
                     os.remove(ref_path)  # reject BGM-contaminated ref
 
         if not scored:
-            first_path = os.path.join(refs_dir, f"{spk}_cand0.wav")
-            final_ref = os.path.join(refs_dir, f"{spk}.wav")
+            first_path = os.path.join(refs_dir, f"{spk_safe}_cand0.wav")
+            final_ref = os.path.join(refs_dir, f"{spk_safe}.wav")
             if os.path.exists(first_path):
                 shutil.copy2(first_path, final_ref)
                 speaker_refs[spk] = final_ref
@@ -623,13 +663,13 @@ def extract_calm_refs(dialogues, vocals_path, workdir,
             if total_dur >= target_seconds:
                 break
 
-        final_ref = os.path.join(refs_dir, f"{spk}.wav")
+        final_ref = os.path.join(refs_dir, f"{spk_safe}.wav")
 
         if len(chosen) == 1:
             shutil.copy2(chosen[0], final_ref)
         else:
             # Concatenate with silence between clips
-            concat_list = os.path.join(refs_dir, f"{spk}_concat.txt")
+            concat_list = os.path.join(refs_dir, f"{spk_safe}_concat.txt")
             silence_path = os.path.join(refs_dir, "silence_0.3s.wav")
             if not os.path.exists(silence_path):
                 subprocess.run([
@@ -1084,117 +1124,143 @@ def resolve_overlaps(manifest):
         return
 
     resolved = 0
-    warned = 0
+    warned_set = set()
 
-    for i in range(len(manifest) - 1):
-        cur = manifest[i]
-        nxt = manifest[i + 1]
+    # Multi-pass: repeat until no more overlaps can be fixed (max 5 passes).
+    # A single forward pass misses cascade overlaps (A overlaps B overlaps C —
+    # fixing A→B may introduce or reveal a new B→C overlap in the same pass).
+    for _pass in range(5):
+        changes_this_pass = 0
 
-        cur_end = cur["start"] + cur["target_duration"]
-        overlap = cur_end - nxt["start"]
+        for i in range(len(manifest) - 1):
+            cur = manifest[i]
+            nxt = manifest[i + 1]
 
-        if overlap <= 0:
-            continue
+            cur_end = cur["start"] + cur["target_duration"]
+            overlap = cur_end - nxt["start"]
 
-        if overlap < 0.2:
-            # Trim: shorten current clip's target duration
-            manifest[i]["target_duration"] = nxt["start"] - cur["start"]
-            resolved += 1
+            if overlap <= 0:
+                continue
 
-        elif overlap < 0.5:
-            # Speed up: re-stretch current clip to fit exactly before next
-            new_target = nxt["start"] - cur["start"]
-            if new_target > 0.1:
-                clip = cur["path"]
-                try:
-                    dur = probe_duration(clip)
-                    ratio = dur / new_target
-                    ratio = min(ratio, 4.0)
-                    if ratio <= 2.0:
-                        af = f"atempo={ratio:.4f}"
-                    else:
-                        r1 = ratio ** 0.5
-                        af = f"atempo={r1:.4f},atempo={r1:.4f}"
-                    tmp = clip + ".overlap.wav"
-                    subprocess.run(
-                        ["ffmpeg", "-y", "-i", clip, "-af", af, tmp],
-                        check=True, capture_output=True
-                    )
-                    if os.path.exists(tmp) and os.path.getsize(tmp) > 500:
-                        os.replace(tmp, clip)
-                        manifest[i]["target_duration"] = new_target
-                        resolved += 1
-                except Exception:
-                    pass
-        else:
-            print(f"  OVERLAP WARNING: line {i} overlaps next by {overlap*1000:.0f}ms — leaving as-is")
-            warned += 1
+            if overlap < 0.2:
+                # Trim: shorten current clip's target duration
+                manifest[i]["target_duration"] = nxt["start"] - cur["start"]
+                resolved += 1
+                changes_this_pass += 1
 
-    if resolved or warned:
-        print(f"  Overlap resolution: {resolved} fixed, {warned} warnings")
+            elif overlap < 0.5:
+                # Speed up: re-stretch current clip to fit exactly before next
+                new_target = nxt["start"] - cur["start"]
+                if new_target > 0.1:
+                    clip = cur["path"]
+                    try:
+                        dur = probe_duration(clip)
+                        ratio = dur / new_target
+                        ratio = min(ratio, 4.0)
+                        if ratio <= 2.0:
+                            af = f"atempo={ratio:.4f}"
+                        else:
+                            r1 = ratio ** 0.5
+                            af = f"atempo={r1:.4f},atempo={r1:.4f}"
+                        tmp = clip + ".overlap.wav"
+                        subprocess.run(
+                            ["ffmpeg", "-y", "-i", clip, "-af", af, tmp],
+                            check=True, capture_output=True
+                        )
+                        if os.path.exists(tmp) and os.path.getsize(tmp) > 500:
+                            os.replace(tmp, clip)
+                            manifest[i]["target_duration"] = new_target
+                            resolved += 1
+                            changes_this_pass += 1
+                    except Exception:
+                        pass
+            elif i not in warned_set:
+                print(f"  OVERLAP WARNING: line {i} overlaps next by {overlap*1000:.0f}ms — leaving as-is")
+                warned_set.add(i)
+
+        if changes_this_pass == 0:
+            break  # converged — no more fixable overlaps
+
+    if resolved or warned_set:
+        print(f"  Overlap resolution: {resolved} fixed, {len(warned_set)} warnings")
 
 
 # ── Timeline Assembly ─────────────────────────────────────────────────────────
 
 def assemble_voice_track(manifest, total_duration, workdir, sample_rate=44100):
-    """Place all clips on timeline, normalize, write WAV. Returns output path."""
+    """Place all clips on timeline using FFmpeg adelay+amix. Returns output path.
+
+    Replaces the old pure-Python sample loop (was O(N*samples) — ~40M iterations
+    for a 24-min episode, ~20-40 min assembly time). FFmpeg handles all format
+    conversion, resampling, delay, and mixing in native C.
+
+    Uses -filter_complex_script to write the filter graph to a temp file, which
+    avoids Windows command-line length limits (32K chars) for 300+ clip episodes.
+    """
     print("\n=== Assembling English voice track ===")
 
-    # Ensure chronological order — out-of-order clips corrupt the timeline
     manifest = sorted(manifest, key=lambda m: m["start"])
-
-    total_samples = int(total_duration * sample_rate)
-    timeline = array.array('d', [0.0]) * total_samples
-
-    for m in manifest:
-        vol = m.get("volume_factor", 1.0)
-
-        try:
-            with wave.open(m["path"], "rb") as wf:
-                nch = wf.getnchannels()
-                sw = wf.getsampwidth()
-                fr = wf.getframerate()
-                raw = wf.readframes(wf.getnframes())
-        except Exception:
-            continue
-
-        if sw != 2:
-            continue
-        samples = struct.unpack(f"<{len(raw)//2}h", raw)
-
-        # Stereo to mono
-        if nch == 2:
-            samples = [(samples[j] + samples[j+1]) / 2 for j in range(0, len(samples), 2)]
-
-        # Resample if needed
-        if fr != sample_rate:
-            ratio = sample_rate / fr
-            new_len = int(len(samples) * ratio)
-            samples = [samples[min(int(j / ratio), len(samples)-1)] for j in range(new_len)]
-
-        # Place on timeline
-        start_sample = int(m["start"] * sample_rate)
-        for j, s in enumerate(samples):
-            idx = start_sample + j
-            if 0 <= idx < total_samples:
-                timeline[idx] += s * vol
-
-    # Normalize
-    peak = max(abs(v) for v in timeline) or 1.0
-    scale = 32000.0 / peak
-
     voice_path = os.path.join(workdir, "english_voice.wav")
-    with wave.open(voice_path, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(struct.pack(f"<{len(timeline)}h",
-            *[max(-32768, min(32767, int(v * scale))) for v in timeline]))
+
+    if not manifest:
+        _ffmpeg_run([
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-t", f"{total_duration:.3f}",
+            "-i", f"anullsrc=r={sample_rate}:cl=mono",
+            "-acodec", "pcm_s16le", voice_path,
+        ])
+        print(f"  Voice track (empty): {voice_path}")
+        return voice_path
+
+    # Filter graph:
+    #   Input 0 — silent base at exactly total_duration (sets output length)
+    #   Inputs 1..N — clips, each aformat'd to mono/target-rate, adelay'd to
+    #                 their subtitle start position, volume-adjusted
+    #   amix all together, duration=first so output = total_duration
+    script_path = os.path.join(workdir, "voice_filter.txt")
+    args = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-t", f"{total_duration:.3f}",
+        "-i", f"anullsrc=r={sample_rate}:cl=mono",
+    ]
+
+    filter_lines = []
+    for k, m in enumerate(manifest):
+        args += ["-i", m["path"]]
+        delay_ms = int(m["start"] * 1000)
+        vol = m.get("volume_factor", 1.0)
+        inp = k + 1  # input 0 is the silence base
+        filter_lines.append(
+            f"[{inp}]aformat=sample_rates={sample_rate}:channel_layouts=mono,"
+            f"adelay={delay_ms},volume={vol:.4f}[d{k}]"
+        )
+
+    base_and_clips = "[0]" + "".join(f"[d{k}]" for k in range(len(manifest)))
+    filter_lines.append(
+        f"{base_and_clips}amix=inputs={len(manifest) + 1}:duration=first:normalize=0[out]"
+    )
+
+    with open(script_path, "w", encoding="utf-8") as f:
+        f.write(";\n".join(filter_lines))
+
+    args += [
+        "-filter_complex_script", script_path,
+        "-map", "[out]",
+        "-acodec", "pcm_s16le", "-ar", str(sample_rate), "-ac", "1",
+        voice_path,
+    ]
+
+    try:
+        _ffmpeg_run(args)
+    finally:
+        try:
+            os.remove(script_path)
+        except Exception:
+            pass
 
     # Duration validation
     try:
-        with wave.open(voice_path, "rb") as _wf:
-            actual_dur = _wf.getnframes() / _wf.getframerate()
+        actual_dur = probe_duration(voice_path)
         delta = abs(actual_dur - total_duration)
         if delta > 2.0:
             print(f"  WARNING: voice track duration mismatch — expected {total_duration:.1f}s, got {actual_dur:.1f}s (delta {delta:.1f}s)")
@@ -1231,12 +1297,17 @@ def mix_audio(voice_path, vocals_path, bg_path, manifest, output_path):
     # 3. Sidechain-compress JP vocals: duck when English voice has signal
     #    threshold=0.02 (~-34dBFS) triggers on voice, ratio=10 gives ~10x attenuation
     # 4. Final mix + dynamics + loudnorm
+    # sidechaincompress requires sidechain channel count to match the main signal.
+    # JP vocals from Demucs are stereo; English voice (sidechain) is mono.
+    # Explicitly upmix the mono sidechain to stereo to avoid channel layout
+    # mismatch crash on FFmpeg < 7 (and deprecation warning on FFmpeg 7+).
     filter_complex = (
         "[0]asplit=2[en_raw][en_sc];"
         "[en_raw]asplit[vl][vr];"
         "[vr]adelay=20[vrd];"
         "[vl][vrd]amerge,volume=2.0[en];"
-        "[1][en_sc]sidechaincompress="
+        "[en_sc]aformat=channel_layouts=stereo[en_sc_st];"
+        "[1][en_sc_st]sidechaincompress="
         "threshold=0.02:ratio=10:attack=5:release=200:makeup=1[ja_sc];"
         "[ja_sc]volume=0.7[ja];"
         "[2]volume=0.8[bg];"
@@ -1245,7 +1316,7 @@ def mix_audio(voice_path, vocals_path, bg_path, manifest, output_path):
         "loudnorm=I=-16:TP=-1.5:LRA=7[out]"
     )
 
-    subprocess.run([
+    _ffmpeg_run([
         "ffmpeg", "-y",
         "-i", voice_path,
         "-i", vocals_path,
@@ -1254,7 +1325,7 @@ def mix_audio(voice_path, vocals_path, bg_path, manifest, output_path):
         "-map", "[out]",
         "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
         output_path
-    ], check=True, capture_output=True)
+    ])
 
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"  Final dub: {output_path} ({size_mb:.1f} MB)")
