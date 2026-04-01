@@ -87,6 +87,12 @@ def generate_clips(tts, dialogues, speaker_refs):
         word_count = len(d["text"].split())
         max_expected = max(d["duration"] * 2.5, word_count * 0.8)
 
+        # Pre-predict English duration — English averages ~2.8 words/sec
+        est_duration = word_count / 2.8
+        speed_factor = 1.0
+        if est_duration > d["duration"] * 1.15 and d["duration"] > 0.5:
+            speed_factor = min(est_duration / d["duration"], 1.4)  # cap at 1.4x
+
         try:
             # Pad short text to prevent GPT-SoVITS stutter on single words
             tts_text = d["text"]
@@ -110,7 +116,7 @@ def generate_clips(tts, dialogues, speaker_refs):
                 "seed": 42,
                 "repetition_penalty": 2.0,
                 "max_new_tokens": max_tokens,
-                "speed_factor": 1.0,
+                "speed_factor": speed_factor,
             }
 
             # Generate clip — same seed always for voice consistency
@@ -270,9 +276,13 @@ def main():
 
     manifest = generate_clips(tts, dialogues, speaker_refs)
 
-    # Step 7: Post-process + time-stretch
+    # Step 7: Post-process + time-stretch + normalize
     dub_common.postprocess_clips(manifest)
     dub_common.time_stretch_clips(manifest)
+    dub_common.normalize_clips(manifest)
+
+    # Step 7b: Resolve overlapping dialogue lines
+    dub_common.resolve_overlaps(manifest)
 
     # Step 8: Assemble voice track
     voice_path = dub_common.assemble_voice_track(manifest, total_duration, WORKDIR)

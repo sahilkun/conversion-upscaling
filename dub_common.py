@@ -217,6 +217,56 @@ def separate_audio(src_mkv, workdir):
 
 # ── Calmness Measurement ──────────────────────────────────────────────────────
 
+def _snr_ok(wav_path, min_snr_db=10.0):
+    """Quick SNR check — rejects clips with heavy background music bleed.
+
+    Estimates SNR by comparing loudest vs quietest 100ms frames.
+    Returns True if SNR >= min_snr_db, False otherwise.
+    """
+    try:
+        with wave.open(wav_path, "rb") as wf:
+            n_channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
+
+        if sampwidth != 2:
+            return True  # can't check, assume OK
+
+        samples = struct.unpack(f"<{len(raw)//2}h", raw)
+        if n_channels == 2:
+            samples = [abs(samples[j] + samples[j+1]) // 2 for j in range(0, len(samples), 2)]
+        else:
+            samples = [abs(s) for s in samples]
+
+        frame_size = framerate // 10  # 100ms frames
+        if frame_size == 0 or len(samples) < frame_size * 3:
+            return True  # too short to check
+
+        frame_rms = []
+        for i in range(0, len(samples) - frame_size, frame_size):
+            frame = samples[i:i + frame_size]
+            rms = (sum(s * s for s in frame) / frame_size) ** 0.5
+            if rms > 0:
+                frame_rms.append(rms)
+
+        if len(frame_rms) < 3:
+            return True
+
+        frame_rms.sort()
+        noise_floor = sum(frame_rms[:max(1, len(frame_rms) // 10)]) / max(1, len(frame_rms) // 10)
+        signal = sum(frame_rms[-(len(frame_rms) // 4):]) / (len(frame_rms) // 4)
+
+        if noise_floor < 1:
+            return True  # near-silence, can't compute SNR meaningfully
+
+        import math
+        snr = 20 * math.log10(signal / noise_floor)
+        return snr >= min_snr_db
+    except Exception:
+        return True  # on error, don't reject
+
+
 def measure_calmness(wav_path):
     """Measure vocal calmness via RMS variance. Lower = calmer."""
     try:
@@ -291,7 +341,10 @@ def extract_calm_refs(dialogues, vocals_path, workdir,
 
             score = measure_calmness(ref_path)
             if score is not None:
-                scored.append((score, ref_path, d["duration"]))
+                if _snr_ok(ref_path):
+                    scored.append((score, ref_path, d["duration"]))
+                else:
+                    os.remove(ref_path)  # reject BGM-contaminated ref
 
         if not scored:
             first_path = os.path.join(refs_dir, f"{spk}_cand0.wav")
@@ -468,6 +521,35 @@ def postprocess_clips(manifest):
     return processed
 
 
+def normalize_clips(manifest):
+    """Normalize each clip to -20 LUFS for consistent per-line volume.
+
+    Runs ffmpeg loudnorm on every clip in-place. Skips clips that fail.
+    Call after time_stretch_clips, before assemble_voice_track.
+    """
+    print("\n=== Normalizing clip volumes (loudnorm -20 LUFS) ===")
+    normalized = 0
+
+    for m in manifest:
+        clip = m["path"]
+        tmp = clip + ".norm.wav"
+        try:
+            subprocess.run([
+                "ffmpeg", "-y", "-i", clip,
+                "-af", "loudnorm=I=-20:TP=-2:LRA=7",
+                "-ar", "44100", tmp
+            ], check=True, capture_output=True)
+            if os.path.exists(tmp) and os.path.getsize(tmp) > 500:
+                os.replace(tmp, clip)
+                normalized += 1
+        except Exception:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    print(f"  Normalized {normalized}/{len(manifest)} clips")
+    return normalized
+
+
 def time_stretch_clips(manifest):
     """Pitch-preserving time-stretch for clips exceeding target duration.
 
@@ -511,6 +593,72 @@ def time_stretch_clips(manifest):
 
     print(f"  Stretched {stretched} clips (pitch-preserving atempo, up to 4x)")
     return stretched
+
+
+# ── Overlap Resolution ───────────────────────────────────────────────────────
+
+def resolve_overlaps(manifest):
+    """Detect and resolve overlapping TTS clips on the timeline.
+
+    Strategy (in order of severity):
+      - overlap < 200ms: trim end of earlier clip
+      - overlap 200–500ms: speed up earlier clip to fit
+      - overlap > 500ms: log warning, leave both (amix handles it)
+
+    Modifies manifest in-place (updates target_duration of affected entries).
+    """
+    if len(manifest) < 2:
+        return
+
+    resolved = 0
+    warned = 0
+
+    for i in range(len(manifest) - 1):
+        cur = manifest[i]
+        nxt = manifest[i + 1]
+
+        cur_end = cur["start"] + cur["target_duration"]
+        overlap = cur_end - nxt["start"]
+
+        if overlap <= 0:
+            continue
+
+        if overlap < 0.2:
+            # Trim: shorten current clip's target duration
+            manifest[i]["target_duration"] = nxt["start"] - cur["start"]
+            resolved += 1
+
+        elif overlap < 0.5:
+            # Speed up: re-stretch current clip to fit exactly before next
+            new_target = nxt["start"] - cur["start"]
+            if new_target > 0.1:
+                clip = cur["path"]
+                try:
+                    dur = probe_duration(clip)
+                    ratio = dur / new_target
+                    ratio = min(ratio, 4.0)
+                    if ratio <= 2.0:
+                        af = f"atempo={ratio:.4f}"
+                    else:
+                        r1 = ratio ** 0.5
+                        af = f"atempo={r1:.4f},atempo={r1:.4f}"
+                    tmp = clip + ".overlap.wav"
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", clip, "-af", af, tmp],
+                        check=True, capture_output=True
+                    )
+                    if os.path.exists(tmp) and os.path.getsize(tmp) > 500:
+                        os.replace(tmp, clip)
+                        manifest[i]["target_duration"] = new_target
+                        resolved += 1
+                except Exception:
+                    pass
+        else:
+            print(f"  OVERLAP WARNING: line {i} overlaps next by {overlap*1000:.0f}ms — leaving as-is")
+            warned += 1
+
+    if resolved or warned:
+        print(f"  Overlap resolution: {resolved} fixed, {warned} warnings")
 
 
 # ── Timeline Assembly ─────────────────────────────────────────────────────────

@@ -521,7 +521,7 @@ def _wav_duration(path):
         return 0.0
 
 
-def _tts_request(tagged_text, ref_b64, temperature, repetition_penalty):
+def _tts_request(tagged_text, ref_b64, temperature, repetition_penalty, speed=1.0):
     """Single TTS API call. Returns response or raises."""
     return requests.post(
         f"{API_URL}/v1/tts",
@@ -530,6 +530,7 @@ def _tts_request(tagged_text, ref_b64, temperature, repetition_penalty):
             "seed": TTS_SEED, "temperature": temperature,
             "top_p": TTS_TOP_P, "repetition_penalty": repetition_penalty,
             "use_memory_cache": "on",
+            "speed": speed,
         },
         timeout=120,
     )
@@ -578,9 +579,16 @@ def generate_clips(dialogues, speaker_refs, ref_cache):
 
         # Add emotion tag to text
         tagged_text = add_emotion_tags(d["text"], emotion)
-        # Max expected duration: 2.5x subtitle duration or generous word-time estimate
         word_count = len(d["text"].split())
+        # Max expected duration: 2.5x subtitle duration or generous word-time estimate
         max_expected = max(d["duration"] * 2.5, word_count * 0.8)
+
+        # Pre-predict English duration — English averages ~2.8 words/sec
+        # If estimate exceeds subtitle window, hint Fish Speech to speak faster
+        est_duration = word_count / 2.8
+        tts_speed = 1.0
+        if est_duration > d["duration"] * 1.15 and d["duration"] > 0.5:
+            tts_speed = min(est_duration / d["duration"], 1.4)  # cap at 1.4x
 
         # Retry schedule: (temperature, repetition_penalty)
         retry_schedule = [
@@ -598,7 +606,7 @@ def generate_clips(dialogues, speaker_refs, ref_cache):
                     os.remove(clip_path)
 
             try:
-                resp = _tts_request(tagged_text, ref_b64, temp, rep_pen)
+                resp = _tts_request(tagged_text, ref_b64, temp, rep_pen, speed=tts_speed)
 
                 if resp.status_code == 200 and len(resp.content) > 1000:
                     with open(clip_path, "wb") as f:
@@ -879,6 +887,13 @@ def main():
 
     # Step 5b: Post-process with emotion effects
     dub_common.postprocess_clips(manifest)
+
+    # Step 5c: Time-stretch + normalize volume per clip
+    dub_common.time_stretch_clips(manifest)
+    dub_common.normalize_clips(manifest)
+
+    # Step 5d: Resolve overlapping dialogue lines
+    dub_common.resolve_overlaps(manifest)
 
     # Step 6: Assemble voice track
     voice_path = dub_common.assemble_voice_track(manifest, total_duration, WORKDIR)
