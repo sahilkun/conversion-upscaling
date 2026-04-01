@@ -132,9 +132,12 @@ def load_speaker_labels(labels_path):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            match = re.match(r"^([FM])(?:,\s*[FM])?\s+(\d+)\s+", line)
+            match = re.match(r"^([FM](?:,\s*[FM])*)\s+(\d+)\s+", line)
             if match:
-                speaker = "female" if match.group(1) == "F" else "male"
+                # Support single label (F 5) and multi-speaker (F,M 5).
+                # For multi-speaker lines, use the first speaker listed.
+                first_char = match.group(1)[0]
+                speaker = "female" if first_char == "F" else "male"
                 idx = int(match.group(2))
                 labels[idx] = speaker
     return labels
@@ -400,10 +403,14 @@ def separate_audio(src_mkv, workdir):
         sys.executable, "-m", "demucs", "-n", "htdemucs",
         "--two-stems", "vocals",
         "-o", separated_dir, full_audio
-    ])
+    ], capture_output=True)
     if result.returncode != 0:
-        raise RuntimeError(f"Demucs failed with exit code {result.returncode}. "
-                           "Check that demucs is installed: pip install demucs")
+        stderr = result.stderr.decode("utf-8", errors="replace").strip()
+        last_lines = "\n".join(stderr.splitlines()[-12:])
+        raise RuntimeError(
+            f"Demucs failed (exit {result.returncode}):\n{last_lines}\n"
+            "Check that demucs is installed: pip install demucs"
+        )
 
     src_vocals = os.path.join(separated_dir, "htdemucs", "full_audio", "vocals.wav")
     src_bg = os.path.join(separated_dir, "htdemucs", "full_audio", "no_vocals.wav")
@@ -532,11 +539,10 @@ def _snr_ok(wav_path, min_snr_db=10.0):
             return True  # can't check, assume OK
 
         samples = struct.unpack(f"<{len(raw)//2}h", raw)
+        # Use signed samples — RMS squaring makes sign irrelevant, and this is
+        # consistent with _voice_fingerprint which also operates on signed samples.
         if n_channels == 2:
-            # Average channels first, then take abs — don't rectify before averaging
-            samples = [abs((samples[j] + samples[j+1]) // 2) for j in range(0, len(samples), 2)]
-        else:
-            samples = [abs(s) for s in samples]
+            samples = [(samples[j] + samples[j+1]) // 2 for j in range(0, len(samples), 2)]
 
         frame_size = framerate // 10  # 100ms frames
         if frame_size == 0 or len(samples) < frame_size * 3:
@@ -549,8 +555,8 @@ def _snr_ok(wav_path, min_snr_db=10.0):
             if rms > 0:
                 frame_rms.append(rms)
 
-        if len(frame_rms) < 3:
-            return True
+        if len(frame_rms) < 4:
+            return True  # need ≥4 frames so len//4 >= 1 (avoids ZeroDivisionError)
 
         frame_rms.sort()
         noise_floor = sum(frame_rms[:max(1, len(frame_rms) // 10)]) / max(1, len(frame_rms) // 10)
@@ -647,11 +653,18 @@ def extract_calm_refs(dialogues, vocals_path, workdir,
                     os.remove(ref_path)  # reject BGM-contaminated ref
 
         if not scored:
+            # All candidates failed SNR check (heavy background music).
+            # Fall back to first extracted clip regardless of quality.
             first_path = os.path.join(refs_dir, f"{spk_safe}_cand0.wav")
             final_ref = os.path.join(refs_dir, f"{spk_safe}.wav")
             if os.path.exists(first_path):
                 shutil.copy2(first_path, final_ref)
                 speaker_refs[spk] = final_ref
+                print(f"  WARNING: {spk} — all {len(candidates)} candidates failed SNR check; "
+                      f"using noisiest ref as fallback (voice may sound unclear)")
+            else:
+                print(f"  WARNING: {spk} — all candidates failed SNR check and cand0 missing; "
+                      f"speaker will use default voice")
             continue
 
         scored.sort(key=lambda x: x[0])
@@ -723,8 +736,11 @@ def resolve_voice_refs(extracted_refs, voices_dir, training_dir=None, speaker_ge
     }
 
     speakers = set(extracted_refs.keys()) if extracted_refs else set()
-    # Ensure at least female and male exist
-    speakers.update(["female", "male"])
+    # Only add generic female/male fallbacks if they actually appear as speaker IDs
+    # in the episode. Named-character episodes (Sachi, Aoi, …) don't need them.
+    for gender in ("female", "male"):
+        if os.path.exists(defaults.get(gender, "")):
+            speakers.add(gender)
 
     def _gender_for(spk):
         """Determine gender for a speaker name.
@@ -873,10 +889,19 @@ def classify_emotion(text, context_before=None, context_after=None):
             "exclaim":   "exclaim",
             "seductive": "seductive",
         }
+        # Emotion strength ranking — pick the stronger of both neighbors, not
+        # just the first match. Avoids before-neighbor always winning over after.
+        _strength = {
+            "intense": 5, "moaning": 4, "angry": 4, "exclaim": 3,
+            "seductive": 3, "crying": 2, "whisper": 1,
+        }
+        best_ne = None
         for ne in neighbor_emotions:
             if ne in context_boost:
-                emotion = context_boost[ne]
-                break
+                if best_ne is None or _strength.get(ne, 0) > _strength.get(best_ne, 0):
+                    best_ne = ne
+        if best_ne:
+            emotion = context_boost[best_ne]
 
     params = _EMOTION_PARAMS.get(emotion, (1.0, 1.0))
     return emotion, params[0], params[1]
@@ -1149,7 +1174,9 @@ def resolve_overlaps(manifest):
                 changes_this_pass += 1
 
             elif overlap < 0.5:
-                # Speed up: re-stretch current clip to fit exactly before next
+                # Speed up: re-stretch current clip to fit exactly before next.
+                # Use _build_stretch_filter (rubberband when available) for same
+                # quality as time_stretch_clips — not hardcoded atempo.
                 new_target = nxt["start"] - cur["start"]
                 if new_target > 0.1:
                     clip = cur["path"]
@@ -1157,11 +1184,7 @@ def resolve_overlaps(manifest):
                         dur = probe_duration(clip)
                         ratio = dur / new_target
                         ratio = min(ratio, 4.0)
-                        if ratio <= 2.0:
-                            af = f"atempo={ratio:.4f}"
-                        else:
-                            r1 = ratio ** 0.5
-                            af = f"atempo={r1:.4f},atempo={r1:.4f}"
+                        af, _ = _build_stretch_filter(ratio)
                         tmp = clip + ".overlap.wav"
                         subprocess.run(
                             ["ffmpeg", "-y", "-i", clip, "-af", af, tmp],
@@ -1241,7 +1264,7 @@ def assemble_voice_track(manifest, total_duration, workdir, sample_rate=44100):
     )
 
     with open(script_path, "w", encoding="utf-8") as f:
-        f.write(";\n".join(filter_lines))
+        f.write(";\n".join(filter_lines) + "\n")  # trailing newline required by some FFmpeg builds
 
     args += [
         "-filter_complex_script", script_path,
@@ -1304,7 +1327,7 @@ def mix_audio(voice_path, vocals_path, bg_path, manifest, output_path):
     filter_complex = (
         "[0]asplit=2[en_raw][en_sc];"
         "[en_raw]asplit[vl][vr];"
-        "[vr]adelay=20[vrd];"
+        "[vr]adelay=20ms[vrd];"
         "[vl][vrd]amerge,volume=2.0[en];"
         "[en_sc]aformat=channel_layouts=stereo[en_sc_st];"
         "[1][en_sc_st]sidechaincompress="

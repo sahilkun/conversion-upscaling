@@ -338,13 +338,13 @@ def main():
 
     manifest = generate_clips(tts, dialogues, speaker_refs)
 
-    # Step 7: Post-process + time-stretch + normalize
+    # Step 7: Post-process + time-stretch + resolve overlaps + normalize.
+    # resolve_overlaps must run before normalize_clips — it re-stretches clips
+    # on disk and those clips need to pass through loudnorm afterwards.
     dub_common.postprocess_clips(manifest)
     dub_common.time_stretch_clips(manifest)
-    dub_common.normalize_clips(manifest)
-
-    # Step 7b: Resolve overlapping dialogue lines
     dub_common.resolve_overlaps(manifest)
+    dub_common.normalize_clips(manifest)
 
     # Step 8: Assemble voice track
     voice_path = dub_common.assemble_voice_track(manifest, total_duration, WORKDIR)

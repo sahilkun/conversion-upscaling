@@ -293,9 +293,10 @@ def extract_references(dialogues, vocals_path):
         print(f"  {spk}: evaluating {len(candidates)} candidates...")
 
         # Extract and score all candidates
+        spk_safe = dub_common._safe_filename(spk)
         scored = []
         for idx, (i, d) in enumerate(candidates):
-            ref_path = os.path.join(refs_dir, f"{spk}_cand{idx}.wav")
+            ref_path = os.path.join(refs_dir, f"{spk_safe}_cand{idx}.wav")
             pad = 0.3
             start = max(0, d["start"] - pad)
             length = d["duration"] + pad * 2
@@ -313,8 +314,8 @@ def extract_references(dialogues, vocals_path):
 
         if not scored:
             # Fallback: use first candidate raw
-            first_path = os.path.join(refs_dir, f"{spk}_cand0.wav")
-            final_ref = os.path.join(refs_dir, f"{spk}.wav")
+            first_path = os.path.join(refs_dir, f"{spk_safe}_cand0.wav")
+            final_ref = os.path.join(refs_dir, f"{spk_safe}.wav")
             if os.path.exists(first_path):
                 import shutil
                 shutil.copy2(first_path, final_ref)
@@ -332,7 +333,7 @@ def extract_references(dialogues, vocals_path):
             if total_dur >= TARGET_REF_SECONDS:
                 break
 
-        final_ref = os.path.join(refs_dir, f"{spk}.wav")
+        final_ref = os.path.join(refs_dir, f"{spk_safe}.wav")
 
         if len(chosen) == 1:
             import shutil
@@ -340,7 +341,7 @@ def extract_references(dialogues, vocals_path):
             print(f"    -> Single clip ({total_dur:.1f}s, calmness: {scored[0][0]:.2f})")
         else:
             # Concatenate chosen clips with 0.3s silence between them
-            concat_list = os.path.join(refs_dir, f"{spk}_concat.txt")
+            concat_list = os.path.join(refs_dir, f"{spk_safe}_concat.txt")
             silence_path = os.path.join(refs_dir, "silence_0.3s.wav")
 
             # Generate a short silence separator
@@ -759,8 +760,11 @@ def postprocess_clips(manifest):
                     "-af", ",".join(af_filters),
                     tmp_path
                 ], check=True, capture_output=True)
-                os.replace(tmp_path, clip_path)
-                processed += 1
+                if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 500:
+                    os.replace(tmp_path, clip_path)
+                    processed += 1
+                elif os.path.exists(tmp_path):
+                    os.remove(tmp_path)
             except Exception:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
@@ -768,118 +772,10 @@ def postprocess_clips(manifest):
     print(f"  Post-processed {processed} clips")
 
 
-# ── Assemble Voice Track ───────────────────────────────────────────────────
-def assemble_voice_track(manifest, total_duration):
-    """Place all clips on timeline with per-clip volume from emotion classification."""
-    print("\n=== Step 6: Assembling English voice track ===")
-
-    total_samples = int(total_duration * SAMPLE_RATE)
-    timeline = array.array('d', [0.0]) * total_samples
-
-    for m in manifest:
-        vol = m.get("volume_factor", 1.0)
-
-        try:
-            with wave.open(m["path"], "rb") as wf:
-                nch = wf.getnchannels()
-                sw = wf.getsampwidth()
-                fr = wf.getframerate()
-                raw = wf.readframes(wf.getnframes())
-        except Exception:
-            continue
-
-        if sw == 2:
-            samples = struct.unpack(f"<{len(raw)//2}h", raw)
-        else:
-            continue
-
-        if nch == 2:
-            samples = [(samples[j] + samples[j+1]) / 2 for j in range(0, len(samples), 2)]
-
-        # Resample if needed
-        if fr != SAMPLE_RATE:
-            ratio = SAMPLE_RATE / fr
-            new_len = int(len(samples) * ratio)
-            samples = [samples[min(int(j / ratio), len(samples)-1)] for j in range(new_len)]
-
-        # Time-stretch if clip is too long for subtitle window
-        clip_dur = len(samples) / SAMPLE_RATE
-        target_dur = m["target_duration"]
-        if clip_dur > target_dur * 1.1 and target_dur > 0.3:
-            ratio = clip_dur / target_dur
-            new_len = int(len(samples) / ratio)
-            samples = [samples[min(int(j * ratio), len(samples)-1)] for j in range(new_len)]
-
-        # Place on timeline with emotion volume
-        start_sample = int(m["start"] * SAMPLE_RATE)
-        for j, s in enumerate(samples):
-            idx = start_sample + j
-            if 0 <= idx < total_samples:
-                timeline[idx] += s * vol
-
-    # Normalize
-    peak = max(abs(v) for v in timeline) or 1.0
-    scale = 32000.0 / peak
-
-    voice_path = os.path.join(WORKDIR, "english_voice.wav")
-    with wave.open(voice_path, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(struct.pack(f"<{len(timeline)}h",
-            *[max(-32768, min(32767, int(v * scale))) for v in timeline]))
-
-    print(f"  Voice track: {voice_path} ({total_duration:.1f}s)")
-    return voice_path
-
-
-# ── Mix Final Audio (smart ducking) ────────────────────────────────────────
-def mix_audio(voice_path, vocals_path, bg_path, manifest, output_path):
-    """Mix English voice + ducked Japanese vocals + background.
-
-    Smart ducking: Japanese vocals are loud between dialogue (moaning, breathing)
-    but ducked during English speech. Uses fade transitions (not hard cuts).
-    Background music always present at moderate level.
-    """
-    print("\n=== Step 7: Mixing final audio ===")
-
-    duck_points = [(m["start"], m["start"] + m["target_duration"]) for m in manifest]
-
-    if duck_points:
-        # Build volume expression with smooth transitions
-        # During English speech: duck to 0.08 (barely audible)
-        # Between dialogue: 0.7 (moaning, breathing clearly audible)
-        parts = [f"between(t,{s:.2f},{e:.2f})" for s, e in duck_points]
-        duck_expr = "+".join(parts)
-        # Smooth with a low-pass on the volume envelope
-        vocal_filter = (
-            f"volume='if({duck_expr},0.08,0.7)':eval=frame,"
-            f"afade=t=in:st=0:d=0.5"  # gentle fade in at start
-        )
-    else:
-        vocal_filter = "volume=0.7"
-
-    subprocess.run([
-        "ffmpeg", "-y",
-        "-i", voice_path,
-        "-i", vocals_path,
-        "-i", bg_path,
-        "-filter_complex",
-        # English voice: prominent, stereo
-        f"[0]aformat=sample_rates=44100:channel_layouts=stereo,volume=2.0[en];"
-        # Japanese vocals: ducked during speech, loud between
-        f"[1]{vocal_filter}[ja];"
-        # Background: always present, moderate
-        f"[2]volume=0.8[bg];"
-        # Mix all three without normalization
-        f"[en][ja][bg]amix=inputs=3:duration=longest:normalize=0[out]",
-        "-map", "[out]",
-        "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2",
-        output_path
-    ], check=True, capture_output=True)
-
-    size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    print(f"  Final dub: {output_path} ({size_mb:.1f} MB)")
+# assemble_voice_track and mix_audio removed — use dub_common versions.
+# The local copies used a pure-Python O(N*samples) loop and an O(N) FFmpeg
+# expression string that both broke on 24-min episodes. dub_common uses
+# FFmpeg adelay+amix (filter_complex_script) and sidechaincompress.
 
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -958,12 +854,12 @@ def main():
     # Step 5b: Post-process with emotion effects
     dub_common.postprocess_clips(manifest)
 
-    # Step 5c: Time-stretch + normalize volume per clip
+    # Step 5c: Time-stretch clips, then resolve overlaps, then normalize.
+    # Order matters: resolve_overlaps re-stretches clips on disk, so it must
+    # run before normalize_clips — otherwise overlap-corrected clips bypass LUFS normalization.
     dub_common.time_stretch_clips(manifest)
-    dub_common.normalize_clips(manifest)
-
-    # Step 5d: Resolve overlapping dialogue lines
     dub_common.resolve_overlaps(manifest)
+    dub_common.normalize_clips(manifest)
 
     # Step 6: Assemble voice track
     voice_path = dub_common.assemble_voice_track(manifest, total_duration, WORKDIR)
