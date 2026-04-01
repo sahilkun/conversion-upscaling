@@ -89,47 +89,6 @@ def assign_speakers(dialogues):
     return dialogues
 
 
-# ── Emotion Classification (ported from XTTS _classify_emotion) ────────────
-def classify_emotion(text):
-    """Classify dialogue line emotion. Returns (emotion, speed_factor, volume_factor).
-
-    emotion: tag for Fish Speech + post-processing type
-    speed_factor: playback speed adjustment (>1 = faster)
-    volume_factor: volume multiplier
-    """
-    tl = text.lower().rstrip()
-
-    # Moaning / climax
-    if re.search(r"ahh|ohh|mmm|ngh|haa|cumming|cum!|shooting out", tl):
-        return "moaning", 0.95, 1.3
-
-    # Exclamatory / intense short bursts
-    if tl.endswith("!") and len(tl) < 25:
-        return "exclaim", 1.1, 1.3
-
-    # Whisper / soft
-    if re.search(r"^(yes|okay|huh|please)\b", tl) and len(tl) < 20:
-        return "whisper", 0.9, 0.7
-
-    # Questions
-    if tl.endswith("?"):
-        return "question", 1.0, 1.0
-
-    # Intense / passionate
-    if re.search(r"can.t stop|can.t wait|so bad|please.*cum|breed me|don.t pull|fill my|deeper|harder|faster|so good|feels", tl):
-        return "intense", 1.05, 1.2
-
-    # Surprised
-    if re.search(r"^(huh|what|eh|wait)\b", tl):
-        return "surprised", 1.0, 1.1
-
-    # Laughing
-    if re.search(r"haha|hehe|lol|funny", tl):
-        return "laughing", 1.0, 1.0
-
-    # Normal
-    return "neutral", 1.0, 1.0
-
 
 def add_emotion_tags(text, emotion):
     """Add Fish Speech inline emotion tags based on classified emotion."""
@@ -414,25 +373,37 @@ def bootstrap_english_refs(dialogues, speaker_refs):
                         tmp = os.path.join(refs_dir, f"{spk_safe}_enboot{ci}.wav")
                         with open(tmp, "wb") as f:
                             f.write(clip_data)
-                        tmp_paths.append(tmp)
+                        # Verify WAV is readable before adding to concat list
+                        try:
+                            with wave.open(tmp, "rb") as _wf:
+                                if _wf.getnframes() == 0:
+                                    raise ValueError("empty")
+                            tmp_paths.append(tmp)
+                        except Exception:
+                            print(f"    WARNING: bootstrap clip {ci} invalid, skipping")
+                            os.remove(tmp)
 
-                    concat_list = os.path.join(refs_dir, f"{spk_safe}_enconcat.txt")
-                    with open(concat_list, "w", encoding="utf-8") as f:
+                    if not tmp_paths:
+                        # All bootstrap clips were invalid — treat as no clips
+                        en_clips = []
+                    else:
+                        concat_list = os.path.join(refs_dir, f"{spk_safe}_enconcat.txt")
+                        with open(concat_list, "w", encoding="utf-8") as f:
+                            for tp in tmp_paths:
+                                p = os.path.abspath(tp).replace("\\", "/").replace("'", "\\'")
+                                f.write(f"file '{p}'\n")
+
+                        subprocess.run([
+                            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                            "-i", concat_list,
+                            "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1",
+                            en_ref_path
+                        ], check=True, capture_output=True)
+
+                        # Cleanup temp files
+                        os.remove(concat_list)
                         for tp in tmp_paths:
-                            p = os.path.abspath(tp).replace("\\", "/").replace("'", "\\'")
-                            f.write(f"file '{p}'\n")
-
-                    subprocess.run([
-                        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-                        "-i", concat_list,
-                        "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "1",
-                        en_ref_path
-                    ], check=True, capture_output=True)
-
-                    # Cleanup temp files
-                    os.remove(concat_list)
-                    for tp in tmp_paths:
-                        os.remove(tp)
+                            os.remove(tp)
 
                 with open(en_ref_path, "rb") as f:
                     cache[spk] = base64.b64encode(f.read()).decode()

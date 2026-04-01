@@ -84,9 +84,13 @@ def parse_ass(path):
         if not text or len(text) < 2:
             continue
 
+        duration = end - start
+        if duration <= 0:
+            continue  # malformed line with start >= end
+
         dialogues.append({
             "start": start, "end": end,
-            "duration": end - start,
+            "duration": duration,
             "style": style, "text": text,
         })
 
@@ -715,10 +719,13 @@ def extract_calm_refs(dialogues, vocals_path, workdir,
 
         speaker_refs[spk] = final_ref
 
-    # Cleanup candidates
+    # Cleanup candidates — skip any file that is a final ref (in speaker_refs.values())
+    refs_to_keep = set(os.path.abspath(p) for p in speaker_refs.values())
     for f in os.listdir(refs_dir):
         if "_cand" in f:
-            os.remove(os.path.join(refs_dir, f))
+            fp = os.path.join(refs_dir, f)
+            if os.path.abspath(fp) not in refs_to_keep:
+                os.remove(fp)
     silence = os.path.join(refs_dir, "silence_0.3s.wav")
     if os.path.exists(silence):
         os.remove(silence)
@@ -987,10 +994,10 @@ def postprocess_clips(manifest):
                 if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 500:
                     os.replace(tmp_path, clip_path)
                     processed += 1
-                    # If atempo was applied the clip duration changed; update
-                    # target_duration to the new on-disk duration so that
-                    # time_stretch_clips doesn't undo the emotion speed change.
-                    if any(f.startswith("atempo=") for f in af_filters):
+                    # If atempo or asetrate was applied the clip duration changed;
+                    # update target_duration so time_stretch_clips doesn't undo it.
+                    if any(f.startswith("atempo=") or f.startswith("asetrate=")
+                           for f in af_filters):
                         new_dur = probe_duration(clip_path)
                         if new_dur and new_dur > 0:
                             m["target_duration"] = new_dur
@@ -1173,7 +1180,10 @@ def resolve_overlaps(manifest):
             cur = manifest[i]
             nxt = manifest[i + 1]
 
-            cur_end = cur["start"] + cur["target_duration"]
+            # Probe actual on-disk duration — target_duration may be stale after
+            # time_stretch_clips or postprocess_clips modified the file in-place.
+            cur_actual = probe_duration(cur["path"]) or cur["target_duration"]
+            cur_end = cur["start"] + cur_actual
             overlap = cur_end - nxt["start"]
 
             if overlap <= 0:
@@ -1267,7 +1277,7 @@ def assemble_voice_track(manifest, total_duration, workdir, sample_rate=44100):
         inp = k + 1  # input 0 is the silence base
         filter_lines.append(
             f"[{inp}]aformat=sample_rates={sample_rate}:channel_layouts=mono,"
-            f"adelay={delay_ms},volume={vol:.4f}[d{k}]"
+            f"adelay=delays={delay_ms}ms:all=1,volume={vol:.4f}[d{k}]"
         )
 
     base_and_clips = "[0]" + "".join(f"[d{k}]" for k in range(len(manifest)))
@@ -1340,7 +1350,7 @@ def mix_audio(voice_path, vocals_path, bg_path, manifest, output_path):
         "[0]asplit=2[en_raw][en_sc];"
         "[en_raw]asplit[vl][vr];"
         "[vr]adelay=20ms[vrd];"
-        "[vl][vrd]amerge,volume=2.0[en];"
+        "[vl][vrd]amerge[en];"
         "[en_sc]aformat=channel_layouts=stereo[en_sc_st];"
         "[1][en_sc_st]sidechaincompress="
         "threshold=0.02:ratio=10:attack=5:release=200:makeup=1[ja_sc];"

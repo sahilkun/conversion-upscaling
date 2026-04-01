@@ -88,7 +88,8 @@ def generate_clips(tts, dialogues, speaker_refs):
                 manifest.append({
                     "path": clip_path, "start": d["start"],
                     "target_duration": d["duration"],
-                    "emotion": emotion, "volume_factor": volume_factor,
+                    "emotion": emotion, "speed_factor": speed_factor,
+                    "volume_factor": volume_factor,
                 })
                 continue
             except Exception:
@@ -307,27 +308,29 @@ def main():
 
     original_cwd = os.getcwd()
     os.chdir(gptsovits_dir)
-    sys.path.insert(0, os.path.join(gptsovits_dir, "GPT_SoVITS"))
-    sys.path.insert(0, gptsovits_dir)
-    from GPT_SoVITS.TTS_infer_pack.TTS import TTS, TTS_Config
-    config = TTS_Config("GPT_SoVITS/configs/tts_infer.yaml")
+    try:
+        sys.path.insert(0, os.path.join(gptsovits_dir, "GPT_SoVITS"))
+        sys.path.insert(0, gptsovits_dir)
+        from GPT_SoVITS.TTS_infer_pack.TTS import TTS, TTS_Config
+        config = TTS_Config("GPT_SoVITS/configs/tts_infer.yaml")
 
-    # Search for any fine-tuned models (not just one series)
-    import glob as _glob
-    trained_s2 = _glob.glob(os.path.join(gptsovits_dir, "experiments", "*", "logs_s2_v2", "G_*.pth"))
-    trained_s1 = _glob.glob(os.path.join(gptsovits_dir, "experiments", "*", "logs_s1_v2", "ckpt", "*.ckpt"))
-    if trained_s2 and trained_s1:
-        config.configs["t2s_weights_path"] = sorted(trained_s1)[-1]
-        config.configs["vits_weights_path"] = sorted(trained_s2)[-1]
-        print(f"  Using FINE-TUNED models!")
-        print(f"    S1: {os.path.basename(config.configs['t2s_weights_path'])}")
-        print(f"    S2: {os.path.basename(config.configs['vits_weights_path'])}")
-    else:
-        print(f"  No fine-tuned models found, using pretrained")
-    config.configs["device"] = "cuda"
-    config.configs["is_half"] = False
-    tts = TTS(config)
-    os.chdir(original_cwd)
+        # Search for any fine-tuned models (not just one series)
+        import glob as _glob
+        trained_s2 = _glob.glob(os.path.join(gptsovits_dir, "experiments", "*", "logs_s2_v2", "G_*.pth"))
+        trained_s1 = _glob.glob(os.path.join(gptsovits_dir, "experiments", "*", "logs_s1_v2", "ckpt", "*.ckpt"))
+        if trained_s2 and trained_s1:
+            config.configs["t2s_weights_path"] = sorted(trained_s1)[-1]
+            config.configs["vits_weights_path"] = sorted(trained_s2)[-1]
+            print(f"  Using FINE-TUNED models!")
+            print(f"    S1: {os.path.basename(config.configs['t2s_weights_path'])}")
+            print(f"    S2: {os.path.basename(config.configs['vits_weights_path'])}")
+        else:
+            print(f"  No fine-tuned models found, using pretrained")
+        config.configs["device"] = "cuda"
+        config.configs["is_half"] = False
+        tts = TTS(config)
+    finally:
+        os.chdir(original_cwd)
     WORKDIR = abs_workdir
     print("  Model loaded!")
 
