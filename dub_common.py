@@ -604,37 +604,146 @@ def resolve_voice_refs(extracted_refs, voices_dir, training_dir=None):
 
 # ── Emotion Classification ────────────────────────────────────────────────────
 
-def classify_emotion(text):
-    """Classify dialogue emotion. Returns (emotion, speed_factor, volume_factor)."""
+# Emotion → (speed_factor, volume_factor)
+_EMOTION_PARAMS = {
+    "moaning":   (0.95, 1.3),
+    "exclaim":   (1.1,  1.3),
+    "whisper":   (0.9,  0.7),
+    "question":  (1.0,  1.0),
+    "intense":   (1.05, 1.2),
+    "surprised": (1.0,  1.1),
+    "laughing":  (1.0,  1.0),
+    "crying":    (0.9,  0.85),
+    "angry":     (1.1,  1.35),
+    "seductive": (0.88, 0.9),
+    "tired":     (0.92, 0.8),
+    "playful":   (1.05, 1.05),
+    "neutral":   (1.0,  1.0),
+}
+
+
+def _classify_single(text):
+    """Single-line emotion classification. Returns emotion string."""
     tl = text.lower().rstrip()
 
-    if re.search(r"ahh|ohh|mmm|ngh|haa|cumming|cum!|shooting out", tl):
-        return "moaning", 0.95, 1.3
-    if tl.endswith("!") and len(tl) < 25:
-        return "exclaim", 1.1, 1.3
-    if re.search(r"^(yes|okay|huh|please)\b", tl) and len(tl) < 20:
-        return "whisper", 0.9, 0.7
+    # Moaning / sexual climax
+    if re.search(r"ahh+|ohh+|mmm+|ngh+|haa+|cumming|cum!|shooting out|i.m coming|going to cum", tl):
+        return "moaning"
+    # Crying / sadness
+    if re.search(r"sobbing|sniff|i.m sorry|forgive me|can.t go on|why did|it hurts so much|tears|crying|wept|weep", tl):
+        return "crying"
+    # Angry
+    if re.search(r"how dare|you idiot|shut up|i hate|damn it|get out|never forgive|you bastard|screw you", tl):
+        return "angry"
+    # Seductive / flirty
+    if re.search(r"come here|want you|tease|seduce|just the two|play with|touch me gently|let me show", tl):
+        return "seductive"
+    # Tired / exhausted
+    if re.search(r"so tired|exhausted|can.t anymore|need to rest|sleepy|worn out|i give up", tl):
+        return "tired"
+    # Playful / teasing
+    if re.search(r"gotcha|just kidding|bet you|you wish|teasing|nyah|try and catch|bet you can.t", tl):
+        return "playful"
+    # Intense arousal
+    if re.search(r"can.t stop|so bad|please.*cum|breed me|don.t pull|fill my|deeper|harder|faster|so good|feels so", tl):
+        return "intense"
+    # Laughing
+    if re.search(r"haha|hehe|pfft|tehehe|lol|funny|hilarious", tl):
+        return "laughing"
+    # Surprised
+    if re.search(r"^(huh|what|eh|wait|no way|seriously)\b", tl):
+        return "surprised"
+    # Whisper — short submissive lines
+    if re.search(r"^(yes|okay|huh|please|i see|really)\b", tl) and len(tl) < 20:
+        return "whisper"
+    # Exclaim — short lines ending in !
+    if tl.endswith("!") and len(tl) < 30:
+        return "exclaim"
+    # Question
     if tl.endswith("?"):
-        return "question", 1.0, 1.0
-    if re.search(r"can.t stop|can.t wait|so bad|please.*cum|breed me|don.t pull|fill my|deeper|harder|faster|so good|feels", tl):
-        return "intense", 1.05, 1.2
-    if re.search(r"^(huh|what|eh|wait)\b", tl):
-        return "surprised", 1.0, 1.1
-    if re.search(r"haha|hehe|lol|funny", tl):
-        return "laughing", 1.0, 1.0
-    return "neutral", 1.0, 1.0
+        return "question"
+
+    return "neutral"
+
+
+def classify_emotion(text, context_before=None, context_after=None):
+    """Classify dialogue emotion using a 3-line context window.
+
+    Args:
+        text: current dialogue line
+        context_before: previous line text (or None)
+        context_after: next line text (or None)
+
+    Returns (emotion, speed_factor, volume_factor).
+
+    Context rules:
+    - If current is neutral but neighbors are intense/moaning/angry/crying,
+      inherit their emotion at reduced intensity (exclaim → neutral stays,
+      intense/moaning → intense, angry → exclaim, crying → whisper)
+    - Explicit cues in current line always win over context
+    """
+    emotion = _classify_single(text)
+
+    # Only apply context boost when current line is neutral/question/whisper
+    if emotion in ("neutral", "question", "whisper") and (context_before or context_after):
+        neighbor_emotions = []
+        if context_before:
+            neighbor_emotions.append(_classify_single(context_before))
+        if context_after:
+            neighbor_emotions.append(_classify_single(context_after))
+
+        # Context inheritance map: strong neighbor → softer version for this line
+        context_boost = {
+            "intense":   "intense",
+            "moaning":   "intense",
+            "angry":     "exclaim",
+            "crying":    "whisper",
+            "exclaim":   "exclaim",
+            "seductive": "seductive",
+        }
+        for ne in neighbor_emotions:
+            if ne in context_boost:
+                emotion = context_boost[ne]
+                break
+
+    params = _EMOTION_PARAMS.get(emotion, (1.0, 1.0))
+    return emotion, params[0], params[1]
+
+
+def classify_emotions_bulk(dialogues):
+    """Classify emotions for all dialogue lines using the full context window.
+
+    More accurate than per-line calls — each line sees its neighbors.
+    Updates dialogues in-place, returns emotion distribution dict.
+    """
+    texts = [d["text"] for d in dialogues]
+    dist = {}
+    for i, d in enumerate(dialogues):
+        prev_text = texts[i - 1] if i > 0 else None
+        next_text = texts[i + 1] if i < len(texts) - 1 else None
+        emotion, speed, vol = classify_emotion(d["text"], prev_text, next_text)
+        d["emotion"] = emotion
+        d["speed_factor"] = speed
+        d["volume_factor"] = vol
+        dist[emotion] = dist.get(emotion, 0) + 1
+    return dist
 
 
 # ── Post-Processing ───────────────────────────────────────────────────────────
 
 def postprocess_clips(manifest):
-    """Apply emotion-aware FFmpeg filters to clips. Returns count processed."""
+    """Apply emotion-aware FFmpeg filters to clips. Returns count processed.
+
+    Emotions with no filter (pass-through): neutral, question, laughing, surprised, playful
+    All others get specific audio shaping.
+    """
     print("\n=== Emotion post-processing ===")
     processed = 0
+    _SKIP = {"neutral", "question", "laughing", "surprised", "playful"}
 
     for m in manifest:
         emotion = m.get("emotion", "neutral")
-        if emotion in ("neutral", "question", "laughing", "surprised"):
+        if emotion in _SKIP:
             continue
 
         clip_path = m["path"]
@@ -642,16 +751,30 @@ def postprocess_clips(manifest):
 
         af_filters = []
         if emotion == "exclaim":
-            af_filters.append("volume=1.3")
-            af_filters.append("asetrate=44100*1.03,aresample=44100")
+            # Louder + slight pitch up for energy
+            af_filters += ["volume=1.3", "asetrate=44100*1.03,aresample=44100"]
+        elif emotion == "angry":
+            # Louder + slight pitch up + subtle distortion edge via treble boost
+            af_filters += ["volume=1.35", "asetrate=44100*1.04,aresample=44100",
+                           "equalizer=f=3000:width_type=o:width=2:g=3"]
         elif emotion == "whisper":
-            af_filters.append("volume=0.75")
-            af_filters.append("lowpass=f=6000")
+            # Quieter + low-pass (breathy, muffled)
+            af_filters += ["volume=0.75", "lowpass=f=6000"]
+        elif emotion == "crying":
+            # Quieter + slight tremolo (wavering voice) + low-pass
+            af_filters += ["volume=0.85", "tremolo=f=4:d=0.15", "lowpass=f=7000"]
         elif emotion == "moaning":
-            af_filters.append("volume=1.2")
-            af_filters.append("atempo=0.95")
+            # Slightly slower + louder
+            af_filters += ["volume=1.2", "atempo=0.95"]
+        elif emotion == "seductive":
+            # Quieter + slight slow-down + low-pass for breathy quality
+            af_filters += ["volume=0.9", "atempo=0.93", "lowpass=f=8000"]
+        elif emotion == "tired":
+            # Quieter + slower + slight low-pass
+            af_filters += ["volume=0.8", "atempo=0.92", "lowpass=f=7500"]
         elif emotion == "intense":
-            af_filters.append("volume=1.2")
+            # Louder only (speed handled by TTS speed_factor)
+            af_filters += ["volume=1.2"]
 
         if af_filters:
             try:
@@ -660,8 +783,9 @@ def postprocess_clips(manifest):
                     "-af", ",".join(af_filters),
                     tmp_path
                 ], check=True, capture_output=True)
-                os.replace(tmp_path, clip_path)
-                processed += 1
+                if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 500:
+                    os.replace(tmp_path, clip_path)
+                    processed += 1
             except Exception:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)

@@ -62,7 +62,10 @@ def generate_clips(tts, dialogues, speaker_refs):
 
     for i, d in enumerate(dialogues):
         clip_path = os.path.join(clips_dir, f"line_{i:04d}.wav")
-        emotion, speed_factor, volume_factor = dub_common.classify_emotion(d["text"])
+        # Use pre-classified emotion (set by classify_emotions_bulk in main)
+        emotion = d.get("emotion", "neutral")
+        speed_factor = d.get("speed_factor", 1.0)
+        volume_factor = d.get("volume_factor", 1.0)
         emotions[emotion] = emotions.get(emotion, 0) + 1
 
         # Skip if already generated (resume support)
@@ -204,6 +207,11 @@ def main():
     if not labels_path and args.llm_speakers:
         speaker_map = dub_common.llm_label_speakers(dialogues, WORKDIR)
     dialogues = dub_common.assign_speakers(dialogues, labels_path=labels_path, speaker_map=speaker_map)
+
+    # Step 2b: Classify emotions with full context window
+    print("\n=== Step 2b: Emotion classification (context-aware) ===")
+    emotion_dist = dub_common.classify_emotions_bulk(dialogues)
+    print(f"  Distribution: {emotion_dist}")
 
     # Step 3: Demucs separation (auto-run if needed)
     vocals_path = os.path.join(WORKDIR, "vocals.wav")
