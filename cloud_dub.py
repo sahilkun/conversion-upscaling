@@ -828,6 +828,7 @@ def main():
     parser.add_argument("--subs", default="subtitle.ass")
     parser.add_argument("--output", default=os.path.join("out", "dub_work", "english_dub.wav"))
     parser.add_argument("--no-cache", action="store_true", help="Force regenerate all clips")
+    parser.add_argument("--llm-speakers", action="store_true", help="Use Claude API to identify character names/genders")
     args = parser.parse_args()
 
     os.makedirs(WORKDIR, exist_ok=True)
@@ -868,10 +869,13 @@ def main():
     print("\n=== Step 1: Parse subtitles ===")
     dialogues = dub_common.parse_ass(args.subs)
 
-    # Step 2: Assign speakers (auto-detect, or manual labels if file exists)
+    # Step 2: Assign speakers (manual > LLM > ASS styles > auto-detect)
     print("\n=== Step 2: Assign speakers ===")
     labels_path = "speaker_labels.txt" if os.path.isfile("speaker_labels.txt") else None
-    dialogues = dub_common.assign_speakers(dialogues, labels_path=labels_path)
+    speaker_map = None
+    if not labels_path and args.llm_speakers:
+        speaker_map = dub_common.llm_label_speakers(dialogues, WORKDIR)
+    dialogues = dub_common.assign_speakers(dialogues, labels_path=labels_path, speaker_map=speaker_map)
 
     # Step 3: Separate audio
     vocals, bg = dub_common.separate_audio(src, WORKDIR)

@@ -68,6 +68,20 @@ def parse_ass(path):
 
 # ── Speaker Detection ─────────────────────────────────────────────────────────
 
+# ASS styles that are formatting/layout — NOT character names
+_GENERIC_STYLES = {
+    "default", "main", "dialogue", "sign", "signs", "note", "notes",
+    "op", "ed", "italics", "italic", "title", "comment", "caption",
+    "thoughts", "internal", "narrator", "scene", "overlap", "flashback",
+    "insert", "on-screen", "onscreen", "screen", "text",
+}
+
+
+def _is_character_style(style_name):
+    """Return True if style name looks like a character name (not a formatting style)."""
+    return style_name.lower() not in _GENERIC_STYLES and len(style_name) >= 2
+
+
 def detect_gender(text):
     """Keyword-based gender detection from dialogue text.
 
@@ -82,7 +96,7 @@ def detect_gender(text):
 
 
 def load_speaker_labels(labels_path):
-    """Parse speaker_labels.txt. Returns {line_index: 'female'|'male'}."""
+    """Parse speaker_labels.txt. Returns {line_index: speaker_id}."""
     labels = {}
     with open(labels_path, encoding="utf-8") as f:
         for line in f:
@@ -97,11 +111,114 @@ def load_speaker_labels(labels_path):
     return labels
 
 
-def assign_speakers(dialogues, labels_path=None):
-    """Assign speaker/gender to each dialogue line.
+def llm_label_speakers(dialogues, workdir, api_key=None):
+    """Use Claude API to identify characters and their genders from ASS dialogue.
 
-    If labels_path exists and is a file, use manual labels.
-    Otherwise, auto-detect using keyword matching + neighbor propagation.
+    Sends unique styles + sample lines to Claude, returns {style_lower: {name, gender}}.
+    Result cached to speaker_map_auto.json — subsequent calls reuse it.
+
+    Requires ANTHROPIC_API_KEY env var or api_key param.
+    Returns empty dict on failure (pipeline falls back to auto-detect).
+    """
+    cache_path = os.path.join(workdir, "speaker_map_auto.json")
+    if os.path.exists(cache_path):
+        with open(cache_path, encoding="utf-8") as f:
+            cached = json.load(f)
+        print(f"  LLM speaker map loaded from cache ({len(cached)} styles)")
+        return cached
+
+    key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        print("  LLM labeling skipped — no ANTHROPIC_API_KEY")
+        return {}
+
+    try:
+        import urllib.request
+        import urllib.error
+
+        # Build style → sample lines mapping
+        style_samples = {}
+        for d in dialogues:
+            s = d["style"]
+            if s not in style_samples:
+                style_samples[s] = []
+            if len(style_samples[s]) < 4:
+                style_samples[s].append(d["text"][:80])
+
+        # Only send character-looking styles
+        style_samples = {s: v for s, v in style_samples.items() if _is_character_style(s)}
+        if not style_samples:
+            return {}
+
+        lines = []
+        for style, samples in style_samples.items():
+            lines.append(f'Style "{style}":')
+            for sample in samples:
+                lines.append(f'  - {sample}')
+        prompt_body = "\n".join(lines)
+
+        prompt = (
+            "You are analyzing anime subtitles. Below are ASS subtitle style names and sample "
+            "dialogue lines for each. Identify which styles represent speaking characters "
+            "(not sound effects or narration). For each character style, provide:\n"
+            "- name: the character's name (use the style name if unclear)\n"
+            "- gender: 'female' or 'male'\n\n"
+            "Respond with ONLY a JSON object mapping style name (lowercase) to "
+            "{\"name\": \"...\", \"gender\": \"...\"}. No explanation.\n\n"
+            f"{prompt_body}"
+        )
+
+        payload = json.dumps({
+            "model": "claude-haiku-4-5-20251001",
+            "max_tokens": 512,
+            "messages": [{"role": "user", "content": prompt}],
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+
+        text = result["content"][0]["text"].strip()
+        # Strip markdown code fences if present
+        if text.startswith("```"):
+            text = re.sub(r"^```[a-z]*\n?", "", text)
+            text = re.sub(r"\n?```$", "", text)
+
+        speaker_map = json.loads(text)
+        # Normalize keys to lowercase
+        speaker_map = {k.lower(): v for k, v in speaker_map.items()}
+
+        os.makedirs(workdir, exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(speaker_map, f, indent=2)
+
+        print(f"  LLM speaker map: {speaker_map}")
+        return speaker_map
+
+    except Exception as e:
+        print(f"  LLM labeling failed ({e}), falling back to auto-detect")
+        return {}
+
+
+def assign_speakers(dialogues, labels_path=None, speaker_map=None):
+    """Assign speaker ID to each dialogue line.
+
+    Priority:
+    1. Manual labels file (speaker_labels.txt)
+    2. LLM speaker_map {style_lower: {name, gender}}
+    3. ASS style name — if it looks like a character name, use it directly
+    4. Keyword gender detection + neighbor propagation fallback
+
+    Each unique character gets their own speaker ID → own voice reference.
     """
     if labels_path and os.path.isfile(labels_path):
         print(f"  Using manual speaker labels: {labels_path}")
@@ -115,39 +232,71 @@ def assign_speakers(dialogues, labels_path=None):
             if "speaker" not in d:
                 d["speaker"] = "female"
                 d["gender"] = "female"
+
+    elif speaker_map:
+        print(f"  Using LLM speaker map ({len(speaker_map)} character styles)...")
+        for d in dialogues:
+            style_key = d["style"].lower()
+            if style_key in speaker_map:
+                entry = speaker_map[style_key]
+                d["speaker"] = entry.get("name", d["style"])
+                d["gender"] = entry.get("gender", "female")
+            elif _is_character_style(d["style"]):
+                # Style not in LLM map but looks like a name — use it directly
+                d["speaker"] = d["style"]
+                d["gender"] = detect_gender(d["text"]) or "female"
+            else:
+                d["speaker"] = "female"
+                d["gender"] = "female"
+
     else:
-        print("  Auto-detecting speaker gender from text...")
-        # Step 1: Keyword detection
+        # Auto-detect: use ASS style names when they look like character names
+        print("  Auto-detecting speakers (ASS styles + keyword gender)...")
+
+        # Pass 1: assign speaker from style name where possible
+        for d in dialogues:
+            if _is_character_style(d["style"]):
+                d["speaker"] = d["style"]
+            # gender still TBD
+
+        # Pass 2: keyword gender detection
         for d in dialogues:
             d["gender"] = detect_gender(d["text"])
 
-        # Step 2: Propagate from neighbors within same style
+        # Pass 3: propagate gender within same style from neighbors
         for i, d in enumerate(dialogues):
             if d["gender"]:
                 continue
             for j in range(max(0, i - 5), min(len(dialogues), i + 5)):
-                if dialogues[j]["style"] == d["style"] and dialogues[j]["gender"]:
+                if dialogues[j]["style"] == d["style"] and dialogues[j].get("gender"):
                     d["gender"] = dialogues[j]["gender"]
                     break
             if not d["gender"]:
                 d["gender"] = "female"
 
-        # Step 3: Assign speaker IDs per (style, gender) combo
-        speaker_map = {}
-        counters = {"female": 0, "male": 0}
+        # Pass 4: for generic styles, assign speaker as gender-based ID
+        gender_counters = {"female": 0, "male": 0}
+        generic_map = {}
         for d in dialogues:
-            key = (d["style"], d["gender"])
-            if key not in speaker_map:
-                counters[d["gender"]] += 1
-                speaker_map[key] = f"{d['gender']}{counters[d['gender']]}"
-            d["speaker"] = speaker_map[key]
+            if "speaker" not in d:
+                key = (d["style"], d["gender"])
+                if key not in generic_map:
+                    gender_counters[d["gender"]] += 1
+                    generic_map[key] = f"{d['gender']}{gender_counters[d['gender']]}"
+                d["speaker"] = generic_map[key]
+
+    # Ensure gender is set for all lines (needed for voice ref fallback)
+    for d in dialogues:
+        if "gender" not in d:
+            d["gender"] = detect_gender(d["text"]) or "female"
 
     # Print summary
     speakers = {}
     for d in dialogues:
         speakers.setdefault(d["speaker"], 0)
         speakers[d["speaker"]] += 1
-    for spk, count in speakers.items():
+    print(f"  Speakers detected: {len(speakers)}")
+    for spk, count in sorted(speakers.items(), key=lambda x: -x[1]):
         print(f"    {spk}: {count} lines")
 
     return dialogues
